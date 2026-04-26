@@ -41,6 +41,7 @@ APP   := $(BUILD)/AndroidMount.app
 C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c
 SWIFT_SRCS := \
     AndroidMount/main.swift \
+    AndroidMount/PhoneSymbol.swift \
     AndroidMount/AppDelegate.swift \
     AndroidMount/USBWatcher.swift \
     AndroidMount/MountManager.swift

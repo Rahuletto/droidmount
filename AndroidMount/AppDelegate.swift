@@ -4,6 +4,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var usbWatcher: USBWatcher?
     private var mountManager: MountManager?
+    private var unmountObserver: NSObjectProtocol?
+    private var sessionPollTimer: Timer?
 
     /// USB location → device info while connected (may mount async).
     private var knownDevices: [UInt32: USBDevice] = [:]
@@ -13,10 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
-            if let img = NSImage(systemSymbolName: "iphone",
-                                 accessibilityDescription: "AndroidMount") {
-                let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-                btn.image = img.withSymbolConfiguration(cfg)
+            if let img = PhoneSymbol.image(pointSize: 15) {
+                btn.image = img
                 btn.image?.isTemplate = true
             } else {
                 btn.title = "Phone"
@@ -28,6 +28,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usbWatcher = USBWatcher { [weak self] event in
             DispatchQueue.main.async { self?.handleUSB(event) }
         }
+
+        unmountObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didUnmountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            if self.mountManager?.reconcileStaleSessions() == true {
+                self.rebuildMenu()
+            }
+        }
+
+        let poll = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self,
+                  let mm = self.mountManager,
+                  !self.knownDevices.isEmpty,
+                  mm.hasActiveMountSessions else { return }
+            if mm.reconcileStaleSessions() {
+                self.rebuildMenu()
+            }
+        }
+        sessionPollTimer = poll
+        RunLoop.main.add(poll, forMode: .common)
+
         rebuildMenu()
 
         if !FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs") &&
@@ -39,8 +63,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        sessionPollTimer?.invalidate()
+        sessionPollTimer = nil
+        if let o = unmountObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(o)
+            unmountObserver = nil
+        }
         usbWatcher?.stop()
-        mountManager?.unmount()
+        mountManager?.unmountBlockingForQuit()
     }
 
     private func handleUSB(_ event: USBEvent) {
@@ -71,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu(error: String? = nil, for failed: USBDevice? = nil) {
         let menu = NSMenu()
+        mountManager?.reconcileStaleSessions()
         guard let mm = mountManager else {
             menu.addItem(withTitle: "Starting…", action: nil, keyEquivalent: "")
             menu.addItem(.separator())
@@ -123,7 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 let item = NSMenuItem(title: dev.name, action: nil, keyEquivalent: "")
                 item.submenu = sub
-                item.image = Self.sfMenuIcon("iphone")
+                item.image = Self.phoneMenuIcon()
                 menu.addItem(item)
             }
             if sortedDevs.contains(where: { mm.mountPoint(for: $0.key) != nil }) {
@@ -140,9 +171,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openMount(_ sender: NSMenuItem) {
-        if let path = sender.representedObject as? String {
-            NSWorkspace.shared.open(URL(fileURLWithPath: path))
-        }
+        guard let path = sender.representedObject as? String else { return }
+        guard Self.isPathUnderAndroidMount(path),
+              FileManager.default.fileExists(atPath: path) else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     @objc private func ejectOne(_ sender: NSMenuItem) {
@@ -186,6 +218,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let s = NSSize(width: 16, height: 16)
         img.size = s
         return img
+    }
+
+    private static func phoneMenuIcon() -> NSImage? {
+        guard let img = PhoneSymbol.image(pointSize: 13) else { return nil }
+        img.isTemplate = true
+        img.size = NSSize(width: 16, height: 16)
+        return img
+    }
+
+    private static func isPathUnderAndroidMount(_ path: String) -> Bool {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".AndroidMount", isDirectory: true).standardizedFileURL.path
+        let p = URL(fileURLWithPath: path).standardizedFileURL.path
+        if p == root { return true }
+        return p.hasPrefix(root + "/")
     }
 
     private func showMacFuseAlert() {

@@ -1,5 +1,5 @@
-import Foundation
 import Darwin
+import Foundation
 
 /// One macFUSE + mtpfuse process per USB location (supports several phones at once).
 final class MountManager {
@@ -25,14 +25,34 @@ final class MountManager {
     }
 
     private let parentDir: String = "\(NSHomeDirectory())/.AndroidMount"
-    /// Finder / sidebar volume icon (macFUSE `volicon=`).
-    private let volumeIconPath =
-        "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/com.apple.iphone.icns"
+
+    /// Optional `volicon=` for macFUSE (Finder often still shows a generic disk for user FUSE).
+    private static let volumeIconCandidates: [String] = [
+        "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/SidebariPhone.icns",
+        "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/com.apple.iphone.icns",
+    ]
 
     private var sessions: [UInt32: Session] = [:]
     private let sessionsLock = NSLock()
 
-    /// Mount one device; idempotent if already mounted for this `locationID`.
+    var hasActiveMountSessions: Bool {
+        sessionsLock.lock()
+        defer { sessionsLock.unlock() }
+        return !sessions.isEmpty
+    }
+
+    private static func sanitizeVolumeLabel(_ name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let mapped = trimmed.map { c -> Character in
+            if c.isLetter || c.isNumber || c == "_" || c == "-" { return c }
+            return "_"
+        }
+        let s = String(mapped)
+        let collapsed = s.replacingOccurrences(of: "__", with: "_")
+        let limited = String(collapsed.prefix(64))
+        return limited.trimmingCharacters(in: CharacterSet(charactersIn: "_")).isEmpty ? "Device" : limited
+    }
+
     func mount(device: USBDevice, completion: @escaping (Result<String, Error>) -> Void) {
         sessionsLock.lock()
         if let existing = sessions[device.locationID] {
@@ -49,6 +69,7 @@ final class MountManager {
 
         let safeDir = device.name
             .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "..", with: "_")
             .trimmingCharacters(in: .whitespaces)
         let tag = String(format: "%08x", device.locationID)
         let base = safeDir.isEmpty ? "Device" : safeDir
@@ -61,26 +82,23 @@ final class MountManager {
             return
         }
 
-        let safeVol = device.name
-            .replacingOccurrences(of: ",", with: "")
-            .replacingOccurrences(of: " ", with: "_")
+        let safeVol = Self.sanitizeVolumeLabel(device.name)
 
-        /* No direct_io: Quick Look / mmap-style readers need normal page-cache
-         * semantics; direct_io breaks many previews on macFUSE. */
-        var fuseOpts =
-            "noappledouble,noapplexattr,noatime," +
+        let fuseOpts =
+            "local,noappledouble,noapplexattr,noatime," +
             "iosize=1048576,daemon_timeout=300," +
             "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
             ",volname=\(safeVol)"
 
-        let fm = FileManager.default
-        if fm.fileExists(atPath: volumeIconPath) {
-            fuseOpts += ",volicon=\(volumeIconPath)"
+        var argv: [String] = ["-f", "-o", fuseOpts]
+        if let v = Self.firstExistingVolumeIconPath() {
+            argv.append("-o")
+            argv.append("volicon=\(v)")
         }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: helper)
-        p.arguments = ["-f", "-o", fuseOpts, mountPoint]
+        p.arguments = argv + [mountPoint]
 
         var env = ProcessInfo.processInfo.environment
         env["DYLD_FALLBACK_LIBRARY_PATH"] =
@@ -92,6 +110,9 @@ final class MountManager {
         let errPipe = Pipe()
         p.standardError = errPipe
         p.standardOutput = Pipe()
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
 
         var didReturn = false
         let returnOnce: (Result<String, Error>) -> Void = { r in
@@ -99,6 +120,7 @@ final class MountManager {
         }
 
         p.terminationHandler = { proc in
+            errPipe.fileHandleForReading.readabilityHandler = nil
             if !didReturn {
                 let data = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let msg = String(data: data, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
@@ -137,22 +159,54 @@ final class MountManager {
 
     func unmount(locationID: UInt32? = nil) {
         sessionsLock.lock()
-        let targets: [UInt32: Session]
+        let targets: [Session]
         if let id = locationID {
             if let s = sessions.removeValue(forKey: id) {
-                targets = [id: s]
+                targets = [s]
             } else {
-                targets = [:]
+                targets = []
             }
         } else {
-            targets = sessions
+            targets = Array(sessions.values)
             sessions.removeAll()
         }
         sessionsLock.unlock()
 
-        for (_, s) in targets {
-            tearDown(session: s)
+        guard !targets.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            for s in targets { self.tearDown(session: s) }
         }
+    }
+
+    func unmountBlockingForQuit() {
+        sessionsLock.lock()
+        let targets = Array(sessions.values)
+        sessions.removeAll()
+        sessionsLock.unlock()
+        for s in targets { tearDown(session: s) }
+    }
+
+    @discardableResult
+    func reconcileStaleSessions() -> Bool {
+        sessionsLock.lock()
+        let snapshot = sessions
+        var removed: [Session] = []
+        var dropKeys: [UInt32] = []
+        for (loc, s) in snapshot {
+            if !isFuseMounted(at: s.mountPoint) {
+                dropKeys.append(loc)
+                removed.append(s)
+            }
+        }
+        for k in dropKeys { sessions.removeValue(forKey: k) }
+        sessionsLock.unlock()
+        guard !removed.isEmpty else { return false }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            for s in removed { self.tearDown(session: s) }
+        }
+        return true
     }
 
     private func tearDown(session: Session) {
@@ -192,8 +246,6 @@ final class MountManager {
         return sessions[locationID]?.mountPoint
     }
 
-    // MARK: - Mount point helpers
-
     private func isFuseMounted(at path: String) -> Bool {
         var st = statfs()
         guard statfs(path, &st) == 0 else { return false }
@@ -229,7 +281,6 @@ final class MountManager {
         runDiskutilUnmountForce(path)
     }
 
-    /// After successful FUSE mount: discourage Spotlight indexing (slow on MTP).
     private static func scheduleSpotlightExcluded(for mountPoint: String) {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
             let noIndex = "\(mountPoint)/.metadata_never_index"
@@ -240,6 +291,11 @@ final class MountManager {
             try? task.run()
             task.waitUntilExit()
         }
+    }
+
+    private static func firstExistingVolumeIconPath() -> String? {
+        let fm = FileManager.default
+        return volumeIconCandidates.first { fm.fileExists(atPath: $0) }
     }
 
     private func terminateMtpfuseProcesses(mountPoint: String) {
