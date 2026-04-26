@@ -38,7 +38,7 @@ SWIFT_FLAGS ?= -O -target $(UNAME_M)-apple-macos11.0
 BUILD := build
 APP   := $(BUILD)/AndroidMount.app
 
-C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_bridge.c
+C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c
 SWIFT_SRCS := \
     AndroidMount/main.swift \
     AndroidMount/AppDelegate.swift \

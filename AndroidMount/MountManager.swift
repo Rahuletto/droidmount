@@ -116,6 +116,7 @@ final class MountManager {
                         self.sessionsLock.lock()
                         self.sessions[device.locationID] = Session(mountPoint: mountPoint, process: p)
                         self.sessionsLock.unlock()
+                        Self.scheduleSpotlightExcluded(for: mountPoint)
                         returnOnce(.success(mountPoint))
                         return
                     }
@@ -131,17 +132,6 @@ final class MountManager {
             }
         } catch {
             completion(.failure(error))
-        }
-
-        let mp = mountPoint
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
-            let noIndex = "\(mp)/.metadata_never_index"
-            _ = FileManager.default.createFile(atPath: noIndex, contents: nil)
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            task.arguments = ["-w", "-s", "com.apple.metadata.spotlight.indexing-disable", "1", mp]
-            try? task.run()
-            task.waitUntilExit()
         }
     }
 
@@ -182,14 +172,7 @@ final class MountManager {
             Thread.sleep(forTimeInterval: 0.15)
         }
 
-        for pid in mtpfusePids(usingMountPoint: mp) {
-            kill(pid, SIGTERM)
-        }
-        Thread.sleep(forTimeInterval: 0.2)
-        for pid in mtpfusePids(usingMountPoint: mp) {
-            kill(pid, SIGKILL)
-        }
-        Thread.sleep(forTimeInterval: 0.15)
+        terminateMtpfuseProcesses(mountPoint: mp)
 
         runDiskutilUnmountForce(mp)
         Thread.sleep(forTimeInterval: 0.15)
@@ -241,15 +224,32 @@ final class MountManager {
 
     private func reclaimStaleFuseMount(at path: String) {
         runDiskutilUnmountForce(path)
-        for pid in mtpfusePids(usingMountPoint: path) {
+        terminateMtpfuseProcesses(mountPoint: path)
+        runDiskutilUnmountForce(path)
+    }
+
+    /// After successful FUSE mount: discourage Spotlight indexing (slow on MTP).
+    private static func scheduleSpotlightExcluded(for mountPoint: String) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
+            let noIndex = "\(mountPoint)/.metadata_never_index"
+            _ = FileManager.default.createFile(atPath: noIndex, contents: nil)
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            task.arguments = ["-w", "-s", "com.apple.metadata.spotlight.indexing-disable", "1", mountPoint]
+            try? task.run()
+            task.waitUntilExit()
+        }
+    }
+
+    private func terminateMtpfuseProcesses(mountPoint: String) {
+        for pid in mtpfusePids(usingMountPoint: mountPoint) {
             kill(pid, SIGTERM)
         }
-        Thread.sleep(forTimeInterval: 0.4)
-        for pid in mtpfusePids(usingMountPoint: path) {
+        Thread.sleep(forTimeInterval: 0.35)
+        for pid in mtpfusePids(usingMountPoint: mountPoint) {
             kill(pid, SIGKILL)
         }
         Thread.sleep(forTimeInterval: 0.2)
-        runDiskutilUnmountForce(path)
     }
 
     private func runDiskutilUnmountForce(_ path: String) {

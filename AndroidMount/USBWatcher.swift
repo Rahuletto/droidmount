@@ -127,10 +127,8 @@ final class USBWatcher {
     }
 
     private func drain(iter: io_iterator_t, added: Bool) {
-        var sawAny = false
         while case let svc = IOIteratorNext(iter), svc != 0 {
             defer { IOObjectRelease(svc) }
-            sawAny = true
             guard let dev = makeDevice(svc) else { continue }
             NSLog("USB %@: %@ (VID=%04x PID=%04x)",
                   added ? "added" : "removed", dev.name, dev.vendorID, dev.productID)
@@ -150,12 +148,6 @@ final class USBWatcher {
                     }
                 }
             }
-        }
-        // If a remove fired but no MTP-looking device matched, still
-        // signal disconnect so a stale mount tears down. We can't
-        // recover the original USBDevice, so emit a generic one.
-        if !added && !sawAny {
-            // nothing to do
         }
     }
 

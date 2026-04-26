@@ -35,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        usbWatcher?.stop()
         mountManager?.unmount()
     }
 

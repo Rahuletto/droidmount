@@ -161,25 +161,13 @@ static int op_open(const char *path, struct fuse_file_info *fi)
 
     int did_prefetch = 0;
     h->cache_ready = 0;
-    /* If we may read from it, pull the contents down once (not for giants). */
+    /* Pull device payload once into staging fd (not for giants). */
     if ((fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
         s.size <= MTP_OP_OPEN_PREFETCH_MAX) {
-        char *buf = malloc((size_t)s.size);
-        if (!buf) { close(h->fd); free(h->path); free(h); return -ENOMEM; }
-        int got = mtp_read(path, buf, (size_t)s.size, 0);
-        if (got < 0) {
-            free(buf); close(h->fd); free(h->path); free(h); return got;
+        int st = mtp_download_to_fd(path, h->fd);
+        if (st != 0) {
+            close(h->fd); free(h->path); free(h); return st;
         }
-        ssize_t off = 0;
-        while (off < got) {
-            ssize_t w = write(h->fd, buf + off, got - off);
-            if (w <= 0) {
-                free(buf); close(h->fd); free(h->path); free(h);
-                return -EIO;
-            }
-            off += w;
-        }
-        free(buf);
         did_prefetch = 1;
         h->cache_ready = 1;
     }

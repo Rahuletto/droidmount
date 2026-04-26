@@ -52,7 +52,12 @@ int main(int argc, char *argv[])
      * "noappledouble" / "noapplexattr" → no AppleDouble/._ files
      * "iosize=1048576" → 1 MiB IO size so Finder copies don't crawl
      * The volname/volicon can be passed in by the launcher via -o. */
-    char **fuse_argv = calloc(argc + 8, sizeof(char *));
+    char **fuse_argv = calloc((size_t)argc + 10, sizeof(char *));
+    if (!fuse_argv) {
+        fprintf(stderr, "mtpfuse: calloc fuse argv failed\n");
+        mtp_close();
+        return 1;
+    }
     int n = 0;
     fuse_argv[n++] = argv[0];
     int saw_o = 0;
@@ -65,6 +70,7 @@ int main(int argc, char *argv[])
         fuse_argv[n++] = (char *)"local,noappledouble,noapplexattr,"
                                  "iosize=1048576,volname=AndroidDevice";
     }
+    fuse_argv[n] = NULL;
 
     mtp_debug_log("entering fuse_main (FUSE session start)");
     int rc = fuse_main(n, fuse_argv, &mtpfuse_ops, NULL);
