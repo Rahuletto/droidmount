@@ -10,6 +10,12 @@
  * Get_File, which avoids Finder “device disappeared” on long USB pulls.
  * On release, if the file was written, the staging file is pushed with
  * mtp_write_full_fd().
+ *
+ * Integrity (multi‑GB safe):
+ *   • Writes loop pwrite(2) until the full Finder buffer is persisted or errno.
+ *   • Reads loop pread(2) until the buffer is filled or EOF (short final read OK).
+ *   • Upload path verifies snapshot byte count before libmtp send; staging size
+ *     comes from fstat(2) so sparse/truncate anomalies do not ship wrong lengths.
  */
 
 #define _DARWIN_C_SOURCE 1
@@ -37,6 +43,8 @@
 /* Skip eager prefetch on open for huge files (SD-card videos): Finder
  * touching them during folder browse won't pull gigabytes up front. */
 #define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)64 * 1024 * 1024)
+/* Match mount iosize=1M; st_blksize=0 confuses some media stacks (QuickTime). */
+#define MTP_ST_BLKSIZE (1048576)
 
 /* Serializes lazy mtp_download_to_fd for one handle; never nest with g_lock. */
 static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -46,6 +54,36 @@ static double fuse_mono_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* Loop pwrite until full buffer — avoids silent truncation if a single pwrite short‑returns. */
+static int pwrite_full(int fd, const char *buf, size_t size, off_t offset)
+{
+    size_t done = 0;
+    while (done < size) {
+        ssize_t w = pwrite(fd, buf + done, size - done, offset + (off_t)done);
+        if (w < 0)
+            return -errno;
+        if (w == 0)
+            return -EIO;
+        done += (size_t)w;
+    }
+    return (int)size;
+}
+
+/* Loop pread until buffer full or EOF (returns byte count, possibly < size). */
+static int pread_loop(int fd, char *buf, size_t size, off_t offset)
+{
+    size_t done = 0;
+    while (done < size) {
+        ssize_t r = pread(fd, buf + done, size - done, offset + (off_t)done);
+        if (r < 0)
+            return -errno;
+        if (r == 0)
+            break;
+        done += (size_t)r;
+    }
+    return (int)done;
 }
 
 /* Stable inode: real MTP handles, synthetic bit for storage volume nodes. */
@@ -65,10 +103,12 @@ static void mtp_fill_stat(const mtp_stat_t *s, struct stat *st)
     if (s->is_dir) {
         st->st_mode  = S_IFDIR | 0777;
         st->st_nlink = 2;
+        st->st_blksize = 4096;
     } else {
         st->st_mode  = S_IFREG | 0666;
         st->st_nlink = 1;
         st->st_size  = (off_t)s->size;
+        st->st_blksize = MTP_ST_BLKSIZE;
         if (s->size)
             st->st_blocks = (blkcnt_t)((s->size + 511) / 512);
     }
@@ -191,6 +231,7 @@ static int pending_getattr(const char *path, struct stat *st)
         st->st_mode  = S_IFREG | 0666;
         st->st_nlink = 1;
         st->st_size  = fst.st_size;
+        st->st_blksize = MTP_ST_BLKSIZE;
         if (fst.st_size)
             st->st_blocks = (blkcnt_t)((fst.st_size + 511) / 512);
         st->st_uid = getuid();
@@ -551,8 +592,21 @@ static int op_getattr(const char *path, struct stat *st)
 
 static int op_fgetattr(const char *path, struct stat *st, struct fuse_file_info *fi)
 {
-    (void)fi;
-    return op_getattr(path, st);
+    int rc = op_getattr(path, st);
+    if (rc != 0)
+        return rc;
+    handle_t *h = (handle_t *)(uintptr_t)fi->fh;
+    if (!h || !h->path || strcmp(h->path, path) != 0)
+        return 0;
+    if (!S_ISREG(st->st_mode))
+        return 0;
+    /* Keep fstat size aligned with the open handle (listing can lag libmtp). */
+    if (!h->created && h->remote_size > 0 &&
+        (uint64_t)st->st_size != h->remote_size) {
+        if (h->remote_size <= (uint64_t)OFF_MAX)
+            st->st_size = (off_t)h->remote_size;
+    }
+    return 0;
 }
 
 /* libfuse: filler's last arg is the dirent offset for seekdir; must be
@@ -757,8 +811,7 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
             pthread_mutex_unlock(&g_stage_mu);
         }
     }
-    ssize_t r = pread(h->fd, buf, size, offset);
-    return (r < 0) ? -errno : (int)r;
+    return pread_loop(h->fd, buf, size, offset);
 }
 
 static int op_write(const char *path, const char *buf, size_t size, off_t offset,
@@ -771,10 +824,11 @@ static int op_write(const char *path, const char *buf, size_t size, off_t offset
         if (st != 0)
             return st;
     }
-    ssize_t w = pwrite(h->fd, buf, size, offset);
-    if (w < 0) return -errno;
+    int w = pwrite_full(h->fd, buf, size, offset);
+    if (w < 0)
+        return w;
     h->dirty = 1;
-    return (int)w;
+    return w;
 }
 
 static int op_truncate(const char *path, off_t size)
@@ -829,16 +883,22 @@ static int op_release(const char *path, struct fuse_file_info *fi)
     /* Upload new or modified files. Created-but-empty must still be sent or
      * the object never appears on the device. */
     if (h->dirty || h->created) {
-        off_t end = lseek(h->fd, 0, SEEK_END);
-        if (end < 0)
+        struct stat fst;
+        if (fstat(h->fd, &fst) < 0) {
             rc = -errno;
-        else {
-            /* Seek to beginning before uploading, as mtp_write_full_fd expects fd at offset 0 */
-            if (lseek(h->fd, 0, SEEK_SET) < 0)
+        } else if (fst.st_size < 0) {
+            rc = -EIO;
+        } else {
+            /* fstat st_size is authoritative (handles sparse/hole edge cases vs SEEK_END). */
+            uint64_t sz64 = (uint64_t)fst.st_size;
+            if (sz64 > (uint64_t)SIZE_MAX) {
+                rc = -EFBIG;
+            } else if (lseek(h->fd, 0, SEEK_SET) < 0) {
                 rc = -errno;
-            else {
-                int wr = mtp_write_full_fd(h->path, h->fd, (size_t)end);
-                if (wr < 0) rc = wr;
+            } else {
+                int wr = mtp_write_full_fd(h->path, h->fd, (size_t)sz64);
+                if (wr < 0)
+                    rc = wr;
             }
         }
     }

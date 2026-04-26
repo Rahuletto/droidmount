@@ -8,6 +8,11 @@
  * resolve() walks path components and calls load_children() only on
  * each ancestor — never recursively prefetches deeper folders.
  *
+ * Phone apps / other PCs change MTP objects without notifying us.
+ * mtp_readdir_snapshot() therefore drops the in-memory listing for that
+ * directory before each readdir so Finder matches the device (MTP has no
+ * push sync).
+ *
  * Locking (deadlock avoidance):
  *   • g_lock  — in-memory tree; callers hold it across resolve/load_children.
  *   • g_mtp   — all libmtp USB I/O; take only while NOT holding g_mtp then
@@ -455,6 +460,23 @@ int mtp_root_volume_icon_active(void)
     return 0;
 }
 #endif
+
+/* Caller must hold g_lock. Frees all cached children (recursive); clears loaded flag. */
+static void dir_drop_children_locked(mtp_node_t *dir)
+{
+    if (!dir || !dir->is_dir)
+        return;
+    mtp_node_t *c = dir->first_child;
+    dir->first_child = NULL;
+    dir->children_loaded = 0;
+    while (c) {
+        mtp_node_t *nx = c->next_sibling;
+        c->next_sibling = NULL;
+        c->parent = NULL;
+        node_free(c);
+        c = nx;
+    }
+}
 
 /* Caller must hold g_lock for the whole call; do not drop it here.
  * (Dropping g_lock during MTP raced with readdir snapshots → corrupt names.) */
@@ -1036,8 +1058,9 @@ int mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out)
         mtp_debug_log("readdir_snapshot ENOTDIR path=%s (%.3fs)", path, now_sec() - t_snap);
         return -ENOTDIR;
     }
-    mtp_debug_log("readdir_snapshot pre-load_children path=%s children_loaded=%d",
-                  path, n->children_loaded);
+    /* Refetch from device: cache was authoritative until the phone changed something. */
+    dir_drop_children_locked(n);
+    mtp_debug_log("readdir_snapshot load_children path=%s (fresh MTP listing)", path);
     load_children(n);
 
     size_t count = 0;
@@ -1200,12 +1223,22 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
         return -EIO;
     }
 
-    ssize_t got = pread(fd, buf, size, offset);
-    int err = (got < 0) ? -errno : (int)got;
+    size_t got = 0;
+    while (got < size) {
+        ssize_t r = pread(fd, buf + got, size - got, offset + (off_t)got);
+        if (r < 0) {
+            int e = errno;
+            close(fd);
+            return -e;
+        }
+        if (r == 0)
+            break;
+        got += (size_t)r;
+    }
     close(fd);
-    mtp_debug_log("mtp_read end path=%s got=%d dt=%.3fs (full file pulled from device each call)",
-                  path, err, now_sec() - t0);
-    return err;
+    mtp_debug_log("mtp_read end path=%s got=%zu dt=%.3fs (full file pulled from device each call)",
+                  path, got, now_sec() - t0);
+    return (int)got;
 }
 
 int mtp_download_to_fd(const char *path, int fd)
@@ -1285,6 +1318,32 @@ static void tree_detach(mtp_node_t *n)
     }
 }
 
+/* UNKNOWN works on many phones; some stacks mis-index video until format is set. */
+static LIBMTP_filetype_t guess_filetype_from_basename(const char *base)
+{
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot[1] == '\0')
+        return LIBMTP_FILETYPE_UNKNOWN;
+    const char *e = dot + 1;
+    if (strcasecmp(e, "mp4") == 0 || strcasecmp(e, "m4v") == 0)
+        return LIBMTP_FILETYPE_MP4;
+    if (strcasecmp(e, "mov") == 0)
+        return LIBMTP_FILETYPE_QT;
+    if (strcasecmp(e, "m4a") == 0)
+        return LIBMTP_FILETYPE_M4A;
+    if (strcasecmp(e, "3gp") == 0 || strcasecmp(e, "3g2") == 0)
+        return LIBMTP_FILETYPE_MPEG;
+    if (strcasecmp(e, "webm") == 0 || strcasecmp(e, "mkv") == 0)
+        return LIBMTP_FILETYPE_UNDEF_VIDEO;
+    if (strcasecmp(e, "jpg") == 0 || strcasecmp(e, "jpeg") == 0)
+        return LIBMTP_FILETYPE_JPEG;
+    if (strcasecmp(e, "png") == 0)
+        return LIBMTP_FILETYPE_PNG;
+    if (strcasecmp(e, "mp3") == 0)
+        return LIBMTP_FILETYPE_MP3;
+    return LIBMTP_FILETYPE_UNKNOWN;
+}
+
 /* Send file bytes from fd (at current offset 0, length size) to MTP at path.
  * Returns 0 on success, -errno on error. On macOS, creates a temporary snapshot
  * file to work around libmtp fd-based send limitations. Automatically deletes
@@ -1360,6 +1419,20 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
         free(path_dup);
         return -errno;
     }
+    {
+        struct stat sst;
+        if (fstat(fd, &sst) != 0) {
+            int e = errno;
+            free(path_dup);
+            return -e;
+        }
+        if ((uint64_t)sst.st_size != (uint64_t)size) {
+            free(path_dup);
+            mtp_debug_log("mtp_write_send_fd: staging size mismatch (got %llu want %zu)",
+                          (unsigned long long)sst.st_size, size);
+            return -EIO;
+        }
+    }
 
     /* Create libmtp file metadata. */
     LIBMTP_file_t *meta = LIBMTP_new_file_t();
@@ -1376,7 +1449,7 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     meta->parent_id = parent_id;
     meta->storage_id = storage_id;
     meta->filesize = (uint64_t)size;
-    meta->filetype = LIBMTP_FILETYPE_UNKNOWN;
+    meta->filetype = guess_filetype_from_basename(basename);
     meta->modificationdate = time(NULL);
 
 #ifdef __APPLE__
@@ -1403,6 +1476,26 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
         free(path_dup);
         mtp_debug_log("mtp_write_send_fd: copy_fd_to_fd_safe failed: %d", copy_rc);
         return copy_rc;
+    }
+
+    struct stat snapst;
+    if (fstat(snapfd, &snapst) != 0) {
+        int e = errno;
+        close(snapfd);
+        unlink(snap_path);
+        LIBMTP_destroy_file_t(meta);
+        free(path_dup);
+        mtp_debug_log("mtp_write_send_fd: fstat(snap) failed: %s", strerror(e));
+        return -e;
+    }
+    if ((uint64_t)snapst.st_size != (uint64_t)size) {
+        close(snapfd);
+        unlink(snap_path);
+        LIBMTP_destroy_file_t(meta);
+        free(path_dup);
+        mtp_debug_log("mtp_write_send_fd: snapshot size mismatch (got %llu want %zu)",
+                      (unsigned long long)snapst.st_size, size);
+        return -EIO;
     }
 
     /* Flush snapshot to disk before sending. */
@@ -1439,6 +1532,34 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
         LIBMTP_destroy_file_t(meta);
         free(path_dup);
         return -EIO;
+    }
+
+    /* libmtp fills item_id on success; confirm device-reported size (truncated USB
+     * uploads otherwise look like “bad MP4” on Mac + phone). */
+    if (meta->item_id != 0u) {
+        pthread_mutex_lock(&g_mtp);
+        LIBMTP_file_t *chk = g_device ? LIBMTP_Get_Filemetadata(g_device, meta->item_id) : NULL;
+        pthread_mutex_unlock(&g_mtp);
+        if (!chk) {
+            mtp_debug_log("mtp_write_send_fd: post-send verify missing metadata oid=%u",
+                          meta->item_id);
+            mtp_delete_object_retry(meta->item_id);
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            return -EIO;
+        }
+        if ((uint64_t)chk->filesize != (uint64_t)size) {
+            mtp_debug_log("mtp_write_send_fd: post-send SIZE oid=%u device=%llu sent=%zu (scrub)",
+                          meta->item_id, (unsigned long long)chk->filesize, size);
+            LIBMTP_destroy_file_t(chk);
+            mtp_delete_object_retry(meta->item_id);
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            return -EIO;
+        }
+        LIBMTP_destroy_file_t(chk);
+    } else {
+        mtp_debug_log("mtp_write_send_fd: post-send verify skipped (item_id==0)");
     }
 
     /* Invalidate parent's child list to force refresh on next readdir. */
