@@ -65,8 +65,10 @@ final class MountManager {
             .replacingOccurrences(of: ",", with: "")
             .replacingOccurrences(of: " ", with: "_")
 
+        /* No direct_io: Quick Look / mmap-style readers need normal page-cache
+         * semantics; direct_io breaks many previews on macFUSE. */
         var fuseOpts =
-            "direct_io,noappledouble,noapplexattr,noatime,max_readahead=0," +
+            "noappledouble,noapplexattr,noatime," +
             "iosize=1048576,daemon_timeout=300," +
             "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
             ",volname=\(safeVol)"

@@ -264,6 +264,24 @@ static int op_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
     return 0;
 }
 
+static int op_flush(const char *path, struct fuse_file_info *fi)
+{
+    (void)path;
+    /* Staging fd is private; nothing to push until release unless dirty. */
+    (void)fi;
+    return 0;
+}
+
+static int op_fsync(const char *path, int datasync, struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)datasync;
+    handle_t *h = (handle_t *)(uintptr_t)fi->fh;
+    if (!h) return 0;
+    if (fsync(h->fd) < 0) return -errno;
+    return 0;
+}
+
 static int op_release(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
@@ -377,6 +395,8 @@ struct fuse_operations mtpfuse_ops = {
     .create      = op_create,
     .read        = op_read,
     .write       = op_write,
+    .flush       = op_flush,
+    .fsync       = op_fsync,
     .release     = op_release,
     .truncate    = op_truncate,
     .ftruncate   = op_ftruncate,
