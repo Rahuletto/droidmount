@@ -122,7 +122,7 @@ final class MountManager {
         let safeVol = Self.sanitizeVolumeLabel(device.name)
 
         let fuseOpts =
-            "local,noappledouble,noapplexattr,noatime," +
+            "local,defer_permissions,noappledouble,noapplexattr,noatime," +
             "iosize=1048576,daemon_timeout=300," +
             "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
             ",volname=\(safeVol)"

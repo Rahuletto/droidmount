@@ -3,9 +3,13 @@
  *
  * Strategy for file IO: MTP is not a streaming file system. Each open
  * creates a backing temp file that we either populate from the device
- * (for read access) or leave empty (for create). All read/write hit the
- * temp file. On release, if the file was written, the temp file is
- * pushed back to the device with mtp_write_full().
+ * (for read access) or leave empty (for create). Reads/writes normally
+ * hit the staging fd. When the device supports GetPartialObject and the
+ * file is larger than MTP_OP_OPEN_PREFETCH_MAX, read-only (or read‑first
+ * RDWR) opens stream via libmtp partial reads instead of a multi‑GB
+ * Get_File, which avoids Finder “device disappeared” on long USB pulls.
+ * On release, if the file was written, the staging file is pushed with
+ * mtp_write_full_fd().
  */
 
 #define _DARWIN_C_SOURCE 1
@@ -21,9 +25,13 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 
 /* Skip eager prefetch on open for huge files (SD-card videos): Finder
  * touching them during folder browse won't pull gigabytes up front. */
@@ -54,10 +62,10 @@ static void mtp_fill_stat(const mtp_stat_t *s, struct stat *st)
 {
     memset(st, 0, sizeof(*st));
     if (s->is_dir) {
-        st->st_mode  = S_IFDIR | 0755;
+        st->st_mode  = S_IFDIR | 0777;
         st->st_nlink = 2;
     } else {
-        st->st_mode  = S_IFREG | 0644;
+        st->st_mode  = S_IFREG | 0666;
         st->st_nlink = 1;
         st->st_size  = (off_t)s->size;
         if (s->size)
@@ -117,6 +125,9 @@ typedef struct {
     int   dirty;       /* set on any write */
     int   created;     /* file did not exist on device at open */
     int   cache_ready; /* 1: temp fd has full device payload (see op_read) */
+    int   use_partial; /* 1: reads use mtp_read_partial until write/truncate */
+    uint32_t object_id;
+    uint64_t remote_size;
 } handle_t;
 
 /* Paths with op_create() open but not yet on the device: Finder stat()s the
@@ -176,7 +187,7 @@ static int pending_getattr(const char *path, struct stat *st)
             return -ecopy;
         }
         memset(st, 0, sizeof(*st));
-        st->st_mode  = S_IFREG | 0644;
+        st->st_mode  = S_IFREG | 0666;
         st->st_nlink = 1;
         st->st_size  = fst.st_size;
         if (fst.st_size)
@@ -217,6 +228,12 @@ static int op_getattr(const char *path, struct stat *st)
         /* pr == 1: not pending; must return real ENOENT, never -1 (ambiguous w/ EPERM). */
     }
     return rc;
+}
+
+static int op_fgetattr(const char *path, struct stat *st, struct fuse_file_info *fi)
+{
+    (void)fi;
+    return op_getattr(path, st);
 }
 
 /* libfuse: filler's last arg is the dirent offset for seekdir; must be
@@ -319,6 +336,25 @@ static handle_t *make_handle(const char *path)
     return h;
 }
 
+/* RDWR large-file opens may read via GetPartialObject until the first write. */
+static int ensure_staging_from_partial(const char *path, handle_t *h)
+{
+    if (!h->use_partial)
+        return 0;
+    pthread_mutex_lock(&g_stage_mu);
+    if (!h->cache_ready) {
+        int st = mtp_download_to_fd(path, h->fd);
+        if (st != 0) {
+            pthread_mutex_unlock(&g_stage_mu);
+            return st;
+        }
+        h->cache_ready = 1;
+    }
+    h->use_partial = 0;
+    pthread_mutex_unlock(&g_stage_mu);
+    return 0;
+}
+
 static int op_open(const char *path, struct fuse_file_info *fi)
 {
     double t0 = fuse_mono_ms();
@@ -330,10 +366,18 @@ static int op_open(const char *path, struct fuse_file_info *fi)
     handle_t *h = make_handle(path);
     if (!h) return -ENOMEM;
 
+    h->object_id = s.object_id;
+    h->remote_size = s.size;
+    h->use_partial = 0;
+    int acc = fi->flags & O_ACCMODE;
+    if (!(fi->flags & O_TRUNC) && s.object_id && s.size > MTP_OP_OPEN_PREFETCH_MAX &&
+        (acc == O_RDONLY || acc == O_RDWR) && mtp_supports_partial_read())
+        h->use_partial = 1;
+
     int did_prefetch = 0;
     h->cache_ready = 0;
     /* Pull device payload once into staging fd (not for giants). */
-    if ((fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
+    if (!h->use_partial && (fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
         s.size <= MTP_OP_OPEN_PREFETCH_MAX) {
         int st = mtp_download_to_fd(path, h->fd);
         if (st != 0) {
@@ -347,11 +391,12 @@ static int op_open(const char *path, struct fuse_file_info *fi)
         ftruncate(h->fd, 0);
         h->dirty = 1;
         h->cache_ready = 1; /* local empty; do not re-download from device */
+        h->use_partial = 0;
     }
     fi->fh = (uint64_t)(uintptr_t)h;
-    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch=%d cache_ready=%d %.2fms",
+    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch=%d partial=%d cache_ready=%d %.2fms",
                   path, fi->flags, (unsigned long long)s.size, did_prefetch,
-                  h->cache_ready, fuse_mono_ms() - t0);
+                  h->use_partial, h->cache_ready, fuse_mono_ms() - t0);
     return 0;
 }
 
@@ -372,6 +417,10 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
 {
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (h->use_partial && !h->created) {
+        int pr = mtp_read_partial(h->object_id, h->remote_size, buf, size, offset);
+        return pr;
+    }
     if (!h->cache_ready) {
         if (h->created) {
             /* op_create: nothing on device to pull */
@@ -396,9 +445,13 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
 static int op_write(const char *path, const char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-    (void)path;
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (h->use_partial) {
+        int st = ensure_staging_from_partial(path, h);
+        if (st != 0)
+            return st;
+    }
     ssize_t w = pwrite(h->fd, buf, size, offset);
     if (w < 0) return -errno;
     h->dirty = 1;
@@ -415,9 +468,13 @@ static int op_truncate(const char *path, off_t size)
 
 static int op_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
 {
-    (void)path;
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (h->use_partial) {
+        int st = ensure_staging_from_partial(path, h);
+        if (st != 0)
+            return st;
+    }
     if (ftruncate(h->fd, size) < 0) return -errno;
     h->dirty = 1;
     return 0;
@@ -435,9 +492,10 @@ static int op_fsync(const char *path, int datasync, struct fuse_file_info *fi)
 {
     (void)path;
     (void)datasync;
-    handle_t *h = (handle_t *)(uintptr_t)fi->fh;
-    if (!h) return 0;
-    if (fsync(h->fd) < 0) return -errno;
+    (void)fi;
+    /* Staging file is an unlinked temp; after Finder shows 100% it often
+     * fsync(2)s the fd — real fsync can fail in ways that show as
+     * “device disappeared” even though the read path succeeded. */
     return 0;
 }
 
@@ -479,22 +537,192 @@ static int op_unlink(const char *path)        { return mtp_unlink(path); }
 static int op_mkdir (const char *path, mode_t m){ (void)m; return mtp_mkdir(path); }
 static int op_rmdir (const char *path)        { return mtp_rmdir(path); }
 
+static int op_access(const char *path, int mask)
+{
+    /* Mounted with defer_permissions: the kernel checks access in the calling
+     * context. Our attrs are synthetic (regular files are 0666 with no +x), so
+     * enforcing mask here makes X_OK fail and Finder shows "no permission". */
+    (void)path;
+    (void)mask;
+    return 0;
+}
+
 static int op_chmod (const char *p, mode_t m) { (void)p;(void)m; return 0; }
 static int op_chown (const char *p, uid_t u, gid_t g) { (void)p;(void)u;(void)g; return 0; }
 static int op_utimens(const char *p, const struct timespec t[2]) { (void)p;(void)t; return 0; }
+
+static void mtp_fill_statvfs_from_bytes(uint64_t tot, uint64_t fr, struct statvfs *st)
+{
+    memset(st, 0, sizeof(*st));
+    unsigned long bs = 4096UL;
+    st->f_bsize = (unsigned long)bs;
+    st->f_frsize = (unsigned long)bs;
+    st->f_namemax = 255;
+    if (tot == 0u) {
+        st->f_blocks = (fsblkcnt_t)(1024UL * 1024UL * 64UL);
+        st->f_bfree = st->f_bavail = (fsblkcnt_t)(1024UL * 1024UL * 32UL);
+        return;
+    }
+    if (fr > tot)
+        fr = tot;
+    st->f_blocks = (fsblkcnt_t)(tot / bs);
+    st->f_bfree = st->f_bavail = (fsblkcnt_t)(fr / bs);
+}
+
+#if defined(__APPLE__)
+static unsigned int statfs_x_seq;
+
+/* Finder copy/metadata uses setattr_x / fsetattr_x; missing handlers → EPERM. */
+static int op_setattr_x(const char *path, struct setattr_x *attr)
+{
+    (void)path;
+    (void)attr;
+    return 0;
+}
+
+static int op_fsetattr_x(const char *path, struct setattr_x *attr,
+                         struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)attr;
+    (void)fi;
+    return 0;
+}
+
+static int op_chflags(const char *path, uint32_t flags)
+{
+    (void)path;
+    (void)flags;
+    return 0;
+}
+
+static void op_monitor(const char *path, uint32_t ev)
+{
+    (void)path;
+    (void)ev;
+}
+
+static int op_renamex(const char *from, const char *to, unsigned int flags)
+{
+    /* Finder uses renamex_np with RENAME_EXCL for atomic moves; rejecting all
+     * non-zero flags surfaced as “no permission” in some macOS versions. */
+    if (flags & (unsigned)RENAME_SWAP)
+        return -EINVAL;
+    if (flags & (unsigned)RENAME_NOFOLLOW_ANY)
+        return -EINVAL;
+    if (flags & (unsigned)RENAME_RESOLVE_BENEATH)
+        return -EINVAL;
+    if (flags & (unsigned)RENAME_EXCL) {
+        mtp_stat_t sx;
+        if (mtp_stat(to, &sx) == 0)
+            return -EEXIST;
+    }
+    return mtp_rename(from, to);
+}
+
+static int op_statfs_x(const char *path, struct statfs *st)
+{
+    if ((++statfs_x_seq % 10U) == 0U)
+        mtp_debug_log("fuse statfs_x #%u path=%s", statfs_x_seq, path);
+    uint64_t tot = 0, fr = 0;
+    int sr = mtp_storage_space_for_path(path, &tot, &fr);
+    memset(st, 0, sizeof(*st));
+    st->f_bsize = 4096;
+    st->f_iosize = 1048576;
+    if (sr != 0 || tot == 0u) {
+        st->f_blocks = (int64_t)1024 * 1024 * 64;
+        st->f_bfree = (int64_t)1024 * 1024 * 32;
+        st->f_bavail = (int64_t)1024 * 1024 * 32;
+    } else {
+        uint64_t bs = 4096u;
+        st->f_blocks = (int64_t)(tot / bs);
+        st->f_bfree = (int64_t)(fr / bs);
+        st->f_bavail = st->f_bfree;
+    }
+    st->f_files = 1000000;
+    st->f_ffree = 500000;
+    strncpy(st->f_fstypename, "mtp", sizeof(st->f_fstypename) - 1);
+    st->f_fstypename[sizeof(st->f_fstypename) - 1] = '\0';
+    return 0;
+}
+
+static int op_exchange(const char *p1, const char *p2, unsigned long opts)
+{
+    (void)p1;
+    (void)p2;
+    (void)opts;
+    return -ENOTSUP;
+}
+
+static int op_getxtimes(const char *path, struct timespec *bkuptime,
+                        struct timespec *crtime)
+{
+    if (!bkuptime || !crtime)
+        return -EINVAL;
+    mtp_stat_t s;
+    int rc = mtp_stat(path, &s);
+    if (rc != 0) {
+        struct stat st;
+        int pr = pending_getattr(path, &st);
+        if (pr != 0)
+            return pr < 0 ? pr : rc;
+        time_t mt = st.st_mtime;
+        bkuptime->tv_sec = mt;
+        bkuptime->tv_nsec = 0;
+        crtime->tv_sec = mt;
+        crtime->tv_nsec = 0;
+        return 0;
+    }
+    time_t mt = (time_t)s.mtime;
+    if (mt == 0 && s.is_dir)
+        mt = time(NULL);
+    bkuptime->tv_sec = mt;
+    bkuptime->tv_nsec = 0;
+    crtime->tv_sec = mt;
+    crtime->tv_nsec = 0;
+    return 0;
+}
+
+static int op_setbkuptime(const char *path, const struct timespec *tv)
+{
+    (void)path;
+    (void)tv;
+    return 0;
+}
+
+static int op_setchgtime(const char *path, const struct timespec *tv)
+{
+    (void)path;
+    (void)tv;
+    return 0;
+}
+
+static int op_setcrtime(const char *path, const struct timespec *tv)
+{
+    (void)path;
+    (void)tv;
+    return 0;
+}
+#endif
 
 static int op_statfs(const char *path, struct statvfs *st)
 {
     static unsigned long statfs_seq;
     if ((++statfs_seq % 10UL) == 0UL)
         mtp_debug_log("fuse statfs #%lu path=%s", statfs_seq, path);
-    memset(st, 0, sizeof(*st));
-    st->f_bsize  = 4096;
-    st->f_frsize = 4096;
-    st->f_blocks = 1024 * 1024 * 64;
-    st->f_bfree  = 1024 * 1024 * 32;
-    st->f_bavail = 1024 * 1024 * 32;
-    st->f_namemax = 255;
+    uint64_t tot = 0, fr = 0;
+    int sr = mtp_storage_space_for_path(path, &tot, &fr);
+    if (sr != 0 || tot == 0u) {
+        memset(st, 0, sizeof(*st));
+        st->f_bsize = 4096;
+        st->f_frsize = 4096;
+        st->f_blocks = 1024UL * 1024UL * 64UL;
+        st->f_bfree = 1024UL * 1024UL * 32UL;
+        st->f_bavail = 1024UL * 1024UL * 32UL;
+        st->f_namemax = 255;
+        return 0;
+    }
+    mtp_fill_statvfs_from_bytes(tot, fr, st);
     return 0;
 }
 
@@ -503,10 +731,17 @@ static int op_getxattr(const char *path, const char *name, char *value, size_t s
                        uint32_t position)
 {
     (void)position;
+    (void)path;
+    (void)value;
+    if (!name)
+        return -EINVAL;
+    /* Empty value for any name: ENOATTR/ENODATA is often surfaced as "permission" in Finder. */
+    (void)size;
+    return 0;
+}
 #else
 static int op_getxattr(const char *path, const char *name, char *value, size_t size)
 {
-#endif
     static unsigned long xattr_seq;
     mtp_debug_log("fuse getxattr #%lu path=%s name=%s", ++xattr_seq, path, name ? name : "?");
     (void)value;
@@ -517,6 +752,7 @@ static int op_getxattr(const char *path, const char *name, char *value, size_t s
     return -ENODATA;
 #endif
 }
+#endif
 
 static int op_listxattr(const char *path, char *list, size_t size)
 {
@@ -536,23 +772,36 @@ static int op_setxattr(const char *path, const char *name, const char *value,
                        size_t size, int flags)
 {
 #endif
+    /* Finder copies quarantine/FinderInfo/etc.; MTP has no xattrs — accept and drop. */
     (void)path;
     (void)name;
     (void)value;
     (void)size;
     (void)flags;
-    return -ENOTSUP;
+    return 0;
 }
 
 static int op_removexattr(const char *path, const char *name)
 {
     (void)path;
     (void)name;
-    return -ENOTSUP;
+    return 0;
+}
+
+static int op_fallocate(const char *path, int mode, off_t offset, off_t length,
+                        struct fuse_file_info *fi)
+{
+    (void)path;
+    (void)mode;
+    (void)offset;
+    (void)length;
+    (void)fi;
+    return 0;
 }
 
 struct fuse_operations mtpfuse_ops = {
     .getattr     = op_getattr,
+    .fgetattr    = op_fgetattr,
     .readdir     = op_readdir,
     .open        = op_open,
     .create      = op_create,
@@ -570,9 +819,24 @@ struct fuse_operations mtpfuse_ops = {
     .chmod       = op_chmod,
     .chown       = op_chown,
     .utimens     = op_utimens,
+    .access      = op_access,
     .statfs      = op_statfs,
+    .fallocate   = op_fallocate,
     .getxattr    = op_getxattr,
     .listxattr   = op_listxattr,
     .setxattr    = op_setxattr,
     .removexattr = op_removexattr,
+#if defined(__APPLE__)
+    .monitor     = op_monitor,
+    .renamex     = op_renamex,
+    .statfs_x    = op_statfs_x,
+    .exchange    = op_exchange,
+    .getxtimes   = op_getxtimes,
+    .setbkuptime = op_setbkuptime,
+    .setchgtime  = op_setchgtime,
+    .setcrtime   = op_setcrtime,
+    .setattr_x   = op_setattr_x,
+    .fsetattr_x  = op_fsetattr_x,
+    .chflags     = op_chflags,
+#endif
 };

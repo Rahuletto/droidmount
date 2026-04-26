@@ -52,6 +52,14 @@ void mtp_readdir_snapshot_free(mtp_dirent_t *entries, size_t n);
  * Returns bytes read or -errno. */
 int  mtp_read(const char *path, char *buf, size_t size, off_t offset);
 
+/* 1 if the device reports LIBMTP_DEVICECAP_GetPartialObject (cached). */
+int mtp_supports_partial_read(void);
+
+/* Range read via GetPartialObject (no full-file pull). [oid] and [file_size]
+ * must match the object opened from the tree. Returns bytes read or -errno. */
+int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
+                     off_t offset);
+
 /* Pull the full object from the device into [fd] (truncated, seek 0). For
  * large files when op_open skips prefetch. Returns 0 or -errno. */
 int  mtp_download_to_fd(const char *path, int fd);
@@ -73,6 +81,10 @@ int  mtp_unlink(const char *path);
 /* mkdir / rmdir. */
 int  mtp_mkdir(const char *path);
 int  mtp_rmdir(const char *path);
+
+/* Free/total bytes for the storage volume containing `path` (from libmtp).
+ * If `path` is `/` or cannot be resolved, sums all storages. Returns 0 or -errno. */
+int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t *free_bytes);
 
 #ifdef __cplusplus
 }

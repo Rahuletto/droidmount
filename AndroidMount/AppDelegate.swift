@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import UserNotifications
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
@@ -151,6 +152,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// One line per top-level storage folder using `statfs` (FUSE reports per-volume space from libmtp).
+    private static func storageSpaceMenuLines(mountPoint: String) -> [String] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: mountPoint) else { return [] }
+        let ignored = Set([".metadata_never_index", ".DS_Store"])
+        let sorted = names.filter { !$0.hasPrefix(".") && !ignored.contains($0) }.sorted()
+        var lines: [String] = []
+        for name in sorted.prefix(8) {
+            let full = (mountPoint as NSString).appendingPathComponent(name)
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
+            var st = statfs()
+            guard statfs(full, &st) == 0 else { continue }
+            let bsize = UInt64(st.f_bsize)
+            let avail = UInt64(st.f_bavail) * bsize
+            let total = UInt64(st.f_blocks) * bsize
+            guard total > 0 else { continue }
+            let availI = avail > UInt64(Int64.max) ? Int64.max : Int64(avail)
+            let totalI = total > UInt64(Int64.max) ? Int64.max : Int64(total)
+            let freeStr = ByteCountFormatter.string(fromByteCount: availI, countStyle: .file)
+            let totStr = ByteCountFormatter.string(fromByteCount: totalI, countStyle: .file)
+            lines.append("\(name) — \(freeStr) free (\(totStr))")
+        }
+        return lines
+    }
+
     private func rebuildMenu(error: String? = nil, for failed: USBDevice? = nil, reconcileSessions: Bool = true) {
         let menu = NSMenu()
         if reconcileSessions {
@@ -193,6 +220,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     open.target = self
                     open.representedObject = mp
                     sub.addItem(open)
+                    for line in Self.storageSpaceMenuLines(mountPoint: mp) {
+                        let cap = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+                        cap.isEnabled = false
+                        sub.addItem(cap)
+                    }
                     let ej = NSMenuItem(title: "Eject", action: #selector(ejectOne(_:)), keyEquivalent: "")
                     ej.target = self
                     ej.representedObject = NSNumber(value: loc)
