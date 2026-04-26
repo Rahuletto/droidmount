@@ -50,26 +50,18 @@ ICNS_FALLBACK := /System/Library/CoreServices/CoreTypes.bundle/Contents/Resource
 # NO_ASPECT_FILL_ICNS=1 copies the source .icns verbatim.
 PACK_ICNS := $(CURDIR)/scripts/pack_iphone_icns.sh
 
-C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c \
-    AdbFuse/adb_subprocess.c
-
-ADBFUSE_SRCS := AdbFuse/main.c AdbFuse/adb_subprocess.c AdbFuse/adbfuse_ops.c
-ADBFUSE_CFLAGS := -O2 -Wall -Wextra -Wno-unused-parameter \
-    -D_FILE_OFFSET_BITS=64 -DFUSE_USE_VERSION=26 \
-    -I$(FUSE_INC)
-ADBFUSE_LDFLAGS := -L$(FUSE_LIB) -lfuse
+C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c
 
 SWIFT_SRCS := \
     AndroidMount/main.swift \
     AndroidMount/PhoneSymbol.swift \
     AndroidMount/AppDelegate.swift \
     AndroidMount/USBWatcher.swift \
-    AndroidMount/AdbWire.swift \
     AndroidMount/MountManager.swift
 
 .PHONY: all mtpfuse app run clean check-deps check-mtpfuse check-e2e
 
-all: app mtpfuse adbfuse bundle
+all: app mtpfuse bundle
 
 # Requires an MTP device + macFUSE; exercises mount, synth dirs, xattr, small copy.
 check-mtpfuse: $(BUILD)/mtpfuse
@@ -84,15 +76,9 @@ check-e2e: bundle
 # ---------- C FUSE helper ----------
 $(BUILD)/mtpfuse: $(C_SRCS) | $(BUILD)
 	@echo "  CC   mtpfuse"
-	@$(CC) $(CFLAGS) -I$(CURDIR)/AdbFuse -o $@ $(C_SRCS) $(LDFLAGS)
+	@$(CC) $(CFLAGS) -o $@ $(C_SRCS) $(LDFLAGS)
 
 mtpfuse: $(BUILD)/mtpfuse
-
-$(BUILD)/adbfuse: $(ADBFUSE_SRCS) | $(BUILD)
-	@echo "  CC   adbfuse"
-	@$(CC) $(ADBFUSE_CFLAGS) -o $@ $(ADBFUSE_SRCS) $(ADBFUSE_LDFLAGS)
-
-adbfuse: $(BUILD)/adbfuse
 
 # ---------- Swift app ----------
 $(BUILD)/AndroidMount.bin: $(SWIFT_SRCS) | $(BUILD)
@@ -103,7 +89,7 @@ $(BUILD)/AndroidMount.bin: $(SWIFT_SRCS) | $(BUILD)
 app: $(BUILD)/AndroidMount.bin
 
 # ---------- .app bundle ----------
-bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse $(BUILD)/adbfuse
+bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse
 	@echo "  BUNDLE $(APP)"
 	@rm -rf "$(APP)"
 	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
@@ -120,13 +106,10 @@ bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse $(BUILD)/adbfuse
 	@if [ -f "icon/drive.icns" ]; then cp "icon/drive.icns" "$(APP)/Contents/Resources/drive.icns" && echo "  ICNS icon/drive.icns → drive.icns"; fi
 	@cp $(BUILD)/AndroidMount.bin "$(APP)/Contents/MacOS/AndroidMount"
 	@cp $(BUILD)/mtpfuse "$(APP)/Contents/MacOS/mtpfuse"
-	@cp $(BUILD)/adbfuse "$(APP)/Contents/MacOS/adbfuse"
 	@chmod +x "$(APP)/Contents/MacOS/AndroidMount" \
-	          "$(APP)/Contents/MacOS/mtpfuse" \
-	          "$(APP)/Contents/MacOS/adbfuse"
+	          "$(APP)/Contents/MacOS/mtpfuse"
 	@# Ad-hoc sign so Gatekeeper allows local launches without a dev account
 	@codesign --force --sign - "$(APP)/Contents/MacOS/mtpfuse" 2>/dev/null || true
-	@codesign --force --sign - "$(APP)/Contents/MacOS/adbfuse" 2>/dev/null || true
 	@codesign --force --deep --sign - "$(APP)" 2>/dev/null || true
 	@echo "  built $(APP)"
 

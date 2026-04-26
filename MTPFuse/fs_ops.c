@@ -16,6 +16,11 @@
  *   • Reads loop pread(2) until the buffer is filled or EOF (short final read OK).
  *   • Upload path verifies snapshot byte count before libmtp send; staging size
  *     comes from fstat(2) so sparse/truncate anomalies do not ship wrong lengths.
+ *
+ * Remote changes (edits on the phone while mounted): MTP does not deliver a
+ * safe in-band event API alongside libmtp’s normal I/O. On macOS we periodically
+ * fuse_invalidate_path only on "/<StorageName>" roots (not "/") so Finder
+ * refreshes listings without flashing the mount-point volume icon as a folder.
  */
 
 #define _DARWIN_C_SOURCE 1
@@ -40,11 +45,46 @@
 #include <sys/xattr.h>
 #endif
 
-/* Skip eager prefetch on open for huge files (SD-card videos): Finder
- * touching them during folder browse won't pull gigabytes up front. */
-#define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)64 * 1024 * 1024)
-/* Match mount iosize=1M; st_blksize=0 confuses some media stacks (QuickTime). */
-#define MTP_ST_BLKSIZE (1048576)
+#if defined(__APPLE__)
+/* See file comment: libmtp’s LIBMTP_Read_Event blocks on USB and races the stack. */
+static struct fuse           *g_mtpfuse_handle;
+static volatile int           g_mtpfuse_remote_inval_stop;
+
+typedef struct {
+    struct fuse *f;
+} mtp_inval_vol_ctx_t;
+
+static void mtp_inval_one_volume_path(const char *path, void *ctx)
+{
+    mtp_inval_vol_ctx_t *c = (mtp_inval_vol_ctx_t *)ctx;
+    int ir = fuse_invalidate_path(c->f, path);
+    if (ir < 0 && ir != -ENOENT)
+        mtp_debug_log("fuse_invalidate_path(%s) rc=%d", path, ir);
+}
+
+static void *mtp_remote_inval_loop(void *arg)
+{
+    (void)arg;
+    while (!g_mtpfuse_remote_inval_stop) {
+        /* 15s: less Finder UI churn than 3s; invalidating "/" made the drive icon flicker. */
+        for (int n = 0; n < 150 && !g_mtpfuse_remote_inval_stop; n++)
+            usleep(100000);
+        struct fuse *f = g_mtpfuse_handle;
+        if (!f || g_mtpfuse_remote_inval_stop)
+            continue;
+        mtp_inval_vol_ctx_t ic = { f };
+        mtp_for_each_volume_directory_path(mtp_inval_one_volume_path, &ic);
+    }
+    return NULL;
+}
+#endif
+
+/* Skip eager prefetch on open for files larger than this (SD-card videos).
+ * Finder touching them during folder browse won't pull gigabytes up front.
+ * Reduced from 64MB to 16MB to avoid freezing on moderately-large files. */
+#define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)16 * 1024 * 1024)
+/* Match default mount iosize (2MiB); st_blksize=0 confuses some media stacks (QuickTime). */
+#define MTP_ST_BLKSIZE (2097152)
 
 /* Serializes lazy mtp_download_to_fd for one handle; never nest with g_lock. */
 static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -182,17 +222,21 @@ typedef struct pending_create {
 static pthread_mutex_t g_pending_mu = PTHREAD_MUTEX_INITIALIZER;
 static pending_create_t *g_pending_creates;
 
-static void pending_add(const char *path, handle_t *h)
+/* 0 = ok, -1 = out of memory (caller must destroy handle). */
+static int pending_add(const char *path, handle_t *h)
 {
+    if (!path || !h)
+        return -1;
     pending_create_t *e = malloc(sizeof(*e));
-    if (!e) return;
+    if (!e) return -1;
     e->path = strdup(path);
-    if (!e->path) { free(e); return; }
+    if (!e->path) { free(e); return -1; }
     e->h = h;
     pthread_mutex_lock(&g_pending_mu);
     e->next = g_pending_creates;
     g_pending_creates = e;
     pthread_mutex_unlock(&g_pending_mu);
+    return 0;
 }
 
 static void pending_remove(handle_t *h)
@@ -220,7 +264,7 @@ static int pending_getattr(const char *path, struct stat *st)
     for (pending_create_t *e = g_pending_creates; e; e = e->next) {
         if (strcmp(e->path, path) != 0) continue;
         handle_t *ph = e->h;
-        if (!ph->created) continue;
+        if (!ph || !ph->created) continue;
         struct stat fst;
         if (fstat(ph->fd, &fst) < 0) {
             int ecopy = errno;
@@ -699,12 +743,22 @@ out:
 
 static handle_t *make_handle(const char *path)
 {
+    if (!path)
+        return NULL;
     handle_t *h = calloc(1, sizeof(*h));
     if (!h) return NULL;
     h->path = strdup(path);
+    if (!h->path) {
+        free(h);
+        return NULL;
+    }
     char tmpl[] = "/tmp/mtpfuse_hXXXXXX";
     h->fd = mkstemp(tmpl);
-    if (h->fd < 0) { free(h->path); free(h); return NULL; }
+    if (h->fd < 0) {
+        free(h->path);
+        free(h);
+        return NULL;
+    }
     unlink(tmpl);
     return h;
 }
@@ -780,7 +834,12 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     if (!h) return -ENOMEM;
     h->created = 1;
     h->cache_ready = 1; /* empty staging file; not on device until release */
-    pending_add(path, h);
+    if (pending_add(path, h) != 0) {
+        close(h->fd);
+        free(h->path);
+        free(h);
+        return -ENOMEM;
+    }
     fi->fh = (uint64_t)(uintptr_t)h;
     return 0;
 }
@@ -790,8 +849,9 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
 {
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (!h->path) return -EIO;
     if (h->use_partial && !h->created) {
-        /* mtp_read: hybrid ADB + MTP fallback (mtp_read_partial alone skips hybrid). */
+        /* mtp_read: full mtp_read path (partial vs full-object per device caps). */
         int pr = mtp_read(h->path, buf, size, offset);
         return pr;
     }
@@ -820,6 +880,7 @@ static int op_write(const char *path, const char *buf, size_t size, off_t offset
 {
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (!h->path) return -EIO;
     if (h->use_partial) {
         int st = ensure_staging_from_partial(path, h);
         if (st != 0)
@@ -844,6 +905,7 @@ static int op_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
 {
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (!h->path) return -EIO;
     if (h->use_partial) {
         int st = ensure_staging_from_partial(path, h);
         if (st != 0)
@@ -878,18 +940,27 @@ static int op_release(const char *path, struct fuse_file_info *fi)
     (void)path;
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return 0;
+    if (!h->path) {
+        close(h->fd);
+        free(h);
+        return -EIO;
+    }
     double t0 = fuse_mono_ms();
     int was_dirty = h->dirty;
     int rc = 0;
     /* Upload new or modified files. Created-but-empty must still be sent or
      * the object never appears on the device. */
     if (h->dirty || h->created) {
-        struct stat fst;
-        if (fstat(h->fd, &fst) < 0) {
+        /* Flush host cache before measuring size / streaming to USB (multi‑GB safe). */
+        if (fsync(h->fd) != 0) {
             rc = -errno;
-        } else if (fst.st_size < 0) {
+        }
+        struct stat fst;
+        if (rc == 0 && fstat(h->fd, &fst) < 0) {
+            rc = -errno;
+        } else if (rc == 0 && fst.st_size < 0) {
             rc = -EIO;
-        } else {
+        } else if (rc == 0) {
             /* fstat st_size is authoritative (handles sparse/hole edge cases vs SEEK_END). */
             uint64_t sz64 = (uint64_t)fst.st_size;
             if (sz64 > (uint64_t)SIZE_MAX) {
@@ -1008,17 +1079,16 @@ static void op_monitor(const char *path, uint32_t ev)
 static int op_renamex(const char *from, const char *to, unsigned int flags)
 {
     /* Finder uses renamex_np with RENAME_EXCL for atomic moves; rejecting all
-     * non-zero flags surfaced as “no permission” in some macOS versions. */
+     * non-zero flags surfaced as "no permission" in some macOS versions. */
     if (flags & (unsigned)RENAME_SWAP)
-        return -EINVAL;
-    if (flags & (unsigned)RENAME_NOFOLLOW_ANY)
-        return -EINVAL;
-    if (flags & (unsigned)RENAME_RESOLVE_BENEATH)
         return -EINVAL;
     if (flags & (unsigned)RENAME_EXCL) {
         mtp_stat_t sx;
-        if (mtp_stat(to, &sx) == 0)
+        int sr = mtp_stat(to, &sx);
+        if (sr == 0)
             return -EEXIST;
+        if (sr != -ENOENT)
+            return sr;
     }
     return mtp_rename_with_xattr(from, to);
 }
@@ -1242,12 +1312,32 @@ static void *op_init(struct fuse_conn_info *conn)
         conn->max_write = (unsigned)1048576;
     if (conn->max_readahead < (unsigned)2097152)
         conn->max_readahead = (unsigned)2097152;
+    struct fuse_context *fc = fuse_get_context();
+    if (fc && fc->fuse) {
+        g_mtpfuse_handle = fc->fuse;
+        g_mtpfuse_remote_inval_stop = 0;
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, mtp_remote_inval_loop, NULL) != 0)
+            mtp_debug_log("pthread_create(mtp_remote_inval_loop) failed");
+        else
+            pthread_detach(tid);
+    }
 #endif
     return NULL;
 }
 
+static void op_destroy(void *userdata)
+{
+    (void)userdata;
+#if defined(__APPLE__)
+    g_mtpfuse_remote_inval_stop = 1;
+    g_mtpfuse_handle = NULL;
+#endif
+}
+
 struct fuse_operations mtpfuse_ops = {
     .init        = op_init,
+    .destroy     = op_destroy,
     .getattr     = op_getattr,
     .fgetattr    = op_fgetattr,
     .readdir     = op_readdir,

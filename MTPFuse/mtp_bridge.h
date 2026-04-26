@@ -95,6 +95,9 @@ int  mtp_rmdir(const char *path);
  * accepted (macOS statfs) so each storage volume gets its own totals. */
 int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t *free_bytes);
 
+/* Invoke [cb] with "/StorageName" for each top-level storage dir (not mount "/"). */
+void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx), void *ctx);
+
 /* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */
 int mtp_root_volume_icon_active(void);
 

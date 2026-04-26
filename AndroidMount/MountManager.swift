@@ -2,18 +2,8 @@ import AppKit
 import Darwin
 import Foundation
 
-/// One macFUSE + mtpfuse process per USB location (supports several phones at once).
+/// One macFUSE + mtpfuse process per USB location (supports several phones at once). Pure MTP (libmtp).
 final class MountManager {
-    /// How the mount is backed; drives Finder / Disk Utility volume title via FUSE `volname=`.
-    enum MountTransport: Equatable {
-        case mtp
-        /// `mtpfuse` with **MTP_HYBRID_ADB**: same folders as MTP; file reads use ADB when mapped.
-        /// `mtpfuse` with **MTP_HYBRID_ADB**: MTP **folders**; reads/writes via **ADB**. Finder title `… (ADB)`.
-        case mtpHybrid
-        /// Wired `adbfuse` (standalone ADB FUSE — not used for menu “Request ADB mode”).
-        case adb
-    }
-
     enum MountError: LocalizedError {
         case helperMissing
         case mountFailed(String)
@@ -21,7 +11,7 @@ final class MountManager {
         var errorDescription: String? {
             switch self {
             case .helperMissing:
-                return "FUSE helper (mtpfuse / adbfuse) not found. Run `make bundle` from the project."
+                return "FUSE helper mtpfuse not found. Run `make bundle` from the project."
             case .mountFailed(let s):
                 return "Mount failed: \(s)"
             case .mountpointBusy:
@@ -34,7 +24,6 @@ final class MountManager {
         let mountPoint: String
         /// Nil when the session was **adopted** after relaunch (FUSE still up; we didn’t spawn this `Process`).
         let process: Process?
-        let transport: MountTransport
     }
 
     private let parentDir: String = "\(NSHomeDirectory())/.AndroidMount"
@@ -48,7 +37,6 @@ final class MountManager {
     private var sessions: [UInt32: Session] = [:]
     private let sessionsLock = NSLock()
     private var cachedMtpfusePath: String?
-    private var cachedAdbfusePath: String?
     private static var cachedVolIconPath: String?
 
     var hasActiveMountSessions: Bool {
@@ -70,8 +58,8 @@ final class MountManager {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
             guard isFuseMounted(at: path) else { continue }
-            if !verifyBrowsableVolume(at: path, transport: .mtp, quick: true) {
-                let stale = Session(mountPoint: path, process: nil, transport: .mtp)
+            if !verifyBrowsableVolume(at: path, quick: true) {
+                let stale = Session(mountPoint: path, process: nil)
                 DispatchQueue.global(qos: .utility).async { [weak self] in
                     self?.tearDown(session: stale)
                 }
@@ -85,7 +73,7 @@ final class MountManager {
             if sessions[lid] != nil { continue }
             let baseParts = parts.dropLast()
             let display = baseParts.isEmpty ? name : baseParts.joined(separator: "_")
-            sessions[lid] = Session(mountPoint: path, process: nil, transport: .mtp)
+            sessions[lid] = Session(mountPoint: path, process: nil)
             Self.applyFinderVolumeIcon(at: path)
             out.append((locationID: lid, displayName: display))
         }
@@ -108,113 +96,17 @@ final class MountManager {
         return limited.trimmingCharacters(in: CharacterSet(charactersIn: "_")).isEmpty ? "Device" : limited
     }
 
-    /// FUSE `volname=` — **(ADB)** for hybrid or `adbfuse`; plain MTP uses the device name only.
-    private static func fuseVolumeLabel(deviceName: String, transport: MountTransport) -> String {
+    private static func fuseVolumeLabel(deviceName: String) -> String {
         let trimmed = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw: String
-        switch transport {
-        case .mtp:
-            raw = trimmed
-        case .mtpHybrid, .adb:
-            raw = trimmed.isEmpty ? "(ADB)" : "\(trimmed) (ADB)"
-        }
-        return sanitizeVolumeLabel(raw)
+        return sanitizeVolumeLabel(trimmed)
     }
 
-    /// Outcome of **Request ADB mode** (menu): **mtpfuse** ADB mode when `adb` works, else plain MTP.
-    struct AdbModeRequestResult {
-        let mountPath: String
-        let usingAdb: Bool
-        /// Shown when the volume is usable on MTP but hybrid ADB was not enabled (restore or already tried).
-        let mtpFallbackMessage: String?
-    }
-
-    /// USB connect and menu **Mount** use MTP. **Request ADB mode** remounts with MTP folders + ADB I/O (title `… (ADB)`).
     func mount(device: USBDevice, completion: @escaping (Result<String, Error>) -> Void) {
-        startFuseMount(device: device, transport: .mtp, adbSerial: nil, completion: completion)
-    }
-
-    /// Unmount then remount **mtpfuse** in ADB mode (MTP `readdir`, ADB reads/writes; Finder shows `… (ADB)`).
-    func requestAdbMode(device: USBDevice, completion: @escaping (Result<AdbModeRequestResult, Error>) -> Void) {
-        sessionsLock.lock()
-        let snap = sessions[device.locationID]
-        sessionsLock.unlock()
-        guard let cur = snap else {
-            completion(.failure(MountError.mountFailed("No active mount for this device.")))
-            return
-        }
-        if cur.transport == .mtpHybrid {
-            completion(.success(AdbModeRequestResult(
-                mountPath: cur.mountPoint, usingAdb: true, mtpFallbackMessage: nil)))
-            return
-        }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            self.unmountBlocking(locationID: device.locationID)
-            Thread.sleep(forTimeInterval: 0.6)
-            let finish: (Result<AdbModeRequestResult, Error>) -> Void = { r in
-                DispatchQueue.main.async { completion(r) }
-            }
-            guard let serial = AdbWire.resolveSerial(for: device), AdbWire.ping(serial: serial) else {
-                self.startFuseMount(device: device, transport: .mtp, adbSerial: nil) { mtp in
-                    switch mtp {
-                    case .success(let path):
-                        finish(.success(AdbModeRequestResult(
-                            mountPath: path,
-                            usingAdb: false,
-                            mtpFallbackMessage:
-                                "Could not reach this device over ADB. Unlock the phone, enable USB debugging, "
-                                + "authorize this Mac, and ensure `adb` is installed. Restored MTP mount.")))
-                    case .failure(let e):
-                        finish(.failure(e))
-                    }
-                }
-                return
-            }
-            self.startFuseMount(device: device, transport: .mtpHybrid, adbSerial: serial) { hy in
-                switch hy {
-                case .success(let path):
-                    finish(.success(AdbModeRequestResult(
-                        mountPath: path, usingAdb: true, mtpFallbackMessage: nil)))
-                case .failure(let hyErr):
-                    let detail = (hyErr as? LocalizedError)?.errorDescription ?? hyErr.localizedDescription
-                    self.startFuseMount(device: device, transport: .mtp, adbSerial: nil) { mtp in
-                        switch mtp {
-                        case .success(let path):
-                            finish(.success(AdbModeRequestResult(
-                                mountPath: path,
-                                usingAdb: false,
-                                mtpFallbackMessage:
-                                    "Could not enable ADB mode. Restored MTP mount. \(detail)")))
-                        case .failure(let e):
-                            finish(.failure(e))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func unmountBlocking(locationID: UInt32) {
-        sessionsLock.lock()
-        guard let s = sessions.removeValue(forKey: locationID) else {
-            sessionsLock.unlock()
-            return
-        }
-        sessionsLock.unlock()
-        tearDown(session: s)
-    }
-
-    func transport(for locationID: UInt32) -> MountTransport? {
-        sessionsLock.lock()
-        defer { sessionsLock.unlock() }
-        return sessions[locationID]?.transport
+        startFuseMount(device: device, completion: completion)
     }
 
     private func startFuseMount(
         device: USBDevice,
-        transport: MountTransport,
-        adbSerial: String?,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         sessionsLock.lock()
@@ -225,14 +117,7 @@ final class MountManager {
         }
         sessionsLock.unlock()
 
-        let helper: String?
-        switch transport {
-        case .adb:
-            helper = resolvedAdbfusePath()
-        case .mtp, .mtpHybrid:
-            helper = resolvedMtpfusePath()
-        }
-        guard let helperPath = helper else {
+        guard let helperPath = resolvedMtpfusePath() else {
             completion(.failure(MountError.helperMissing))
             return
         }
@@ -252,10 +137,10 @@ final class MountManager {
             return
         }
 
-        let safeVol = Self.fuseVolumeLabel(deviceName: device.name, transport: transport)
+        let safeVol = Self.fuseVolumeLabel(deviceName: device.name)
         let fuseOpts =
             "local,defer_permissions,noappledouble,noatime," +
-            "iosize=1048576,daemon_timeout=300," +
+            "iosize=1048576,daemon_timeout=86400," +
             "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
             ",volname=\(safeVol)"
 
@@ -273,30 +158,10 @@ final class MountManager {
         env["DYLD_FALLBACK_LIBRARY_PATH"] =
             "/opt/homebrew/lib:/usr/local/lib:/Library/Frameworks/macFUSE.framework/Versions/A:" +
             (env["DYLD_FALLBACK_LIBRARY_PATH"] ?? "")
-        switch transport {
-        case .mtp:
-            env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
-            env.removeValue(forKey: "ADB_SERIAL")
-            env.removeValue(forKey: "ADB_DEVICE_PREFIX")
-            env.removeValue(forKey: "MTP_HYBRID_ADB")
-        case .mtpHybrid:
-            env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
-            env["MTP_HYBRID_ADB"] = "1"
-            if env["ANDROIDMOUNT_ADB_MAX_PARALLEL"] == nil {
-                env["ANDROIDMOUNT_ADB_MAX_PARALLEL"] = "5"
-            }
-            if let s = adbSerial, !s.isEmpty {
-                env["ADB_SERIAL"] = s
-            }
-            env.removeValue(forKey: "ADB_DEVICE_PREFIX")
-        case .adb:
-            env.removeValue(forKey: "MTP_USB_BUS_LOCATION")
-            env.removeValue(forKey: "MTP_HYBRID_ADB")
-            if let s = adbSerial, !s.isEmpty {
-                env["ADB_SERIAL"] = s
-            }
-            env["ADB_DEVICE_PREFIX"] = "/storage"
-        }
+        env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
+        env.removeValue(forKey: "ADB_SERIAL")
+        env.removeValue(forKey: "ADB_DEVICE_PREFIX")
+        env.removeValue(forKey: "MTP_HYBRID_ADB")
         if let ic = Self.resolvedDriveIcnsPath() {
             env["MTP_VOLUME_ICON_PATH"] = ic
         }
@@ -320,7 +185,7 @@ final class MountManager {
             stderrLock.unlock()
         }
 
-        let helperTag = transport == .adb ? "adbfuse" : "mtpfuse"
+        let helperTag = "mtpfuse"
         var didReturn = false
         let returnOnce: (Result<String, Error>) -> Void = { r in
             if !didReturn { didReturn = true; completion(r) }
@@ -353,9 +218,7 @@ final class MountManager {
                 if fromPipe.isEmpty {
                     msg =
                         "process exited with status \(code) before the volume appeared (no stderr). " +
-                        (transport == .adb
-                            ? "Check USB debugging is on and this Mac is authorized."
-                            : "Is the phone in File transfer (MTP) mode and unlocked?")
+                        "Is the phone in File transfer (MTP) mode and unlocked?"
                 } else {
                     msg = fromPipe
                 }
@@ -370,24 +233,17 @@ final class MountManager {
                 for _ in 0..<40 {
                     Thread.sleep(forTimeInterval: 0.2)
                     if self.isFuseMounted(at: mountPoint) {
-                        if !self.verifyBrowsableVolume(at: mountPoint, transport: transport) {
-                            let msg: String
-                            if transport == .adb {
-                                msg =
-                                    "ADB mount came up empty — unlock the phone, confirm USB debugging, " +
-                                    "or try unplugging and reconnecting."
-                            } else {
-                                msg =
-                                    "No storage is visible yet — unlock the phone and set USB to File transfer (MTP). " +
-                                    "If it already is, try unplugging and reconnecting."
-                            }
+                        if !self.verifyBrowsableVolume(at: mountPoint) {
+                            let msg =
+                                "No storage is visible yet — unlock the phone and set USB to File transfer (MTP). " +
+                                "If it already is, try unplugging and reconnecting."
                             returnOnce(.failure(MountError.mountFailed(msg)))
                             self.abortEphemeralFuseMount(process: p, mountPoint: mountPoint)
                             return
                         }
                         self.sessionsLock.lock()
                         self.sessions[device.locationID] =
-                            Session(mountPoint: mountPoint, process: p, transport: transport)
+                            Session(mountPoint: mountPoint, process: p)
                         self.sessionsLock.unlock()
                         Self.scheduleSpotlightExcluded(for: mountPoint)
                         Self.applyFinderVolumeIcon(at: mountPoint)
@@ -407,10 +263,7 @@ final class MountManager {
                 if !errTail.isEmpty {
                     detail += " \(helperTag) said:\n" + errTail
                 } else if !p.isRunning {
-                    detail +=
-                        transport == .adb
-                        ? " \(helperTag) exited; check USB debugging and `adb devices`."
-                        : " \(helperTag) exited; check MTP mode and USB connection."
+                    detail += " \(helperTag) exited; check MTP mode and USB connection."
                 }
                 returnOnce(.failure(MountError.mountFailed(detail)))
             }
@@ -509,23 +362,15 @@ final class MountManager {
         return sessions[locationID]?.mountPoint
     }
 
-    /// Wait until the FUSE root shows real content (MTP storage or `/storage` children over ADB).
+    /// Wait until the FUSE root lists MTP storage volumes.
     /// - Parameter quick: Shorter polling when adopting orphans at launch (avoid blocking UI).
-    private func verifyBrowsableVolume(at mountPoint: String, transport: MountTransport, quick: Bool = false) -> Bool {
+    private func verifyBrowsableVolume(at mountPoint: String, quick: Bool = false) -> Bool {
         let fm = FileManager.default
         let ignored = Set([
             ".metadata_never_index", ".DS_Store",
         ])
-        let attempts: Int
-        let step: TimeInterval
-        switch transport {
-        case .adb:
-            attempts = quick ? 12 : 40
-            step = quick ? 0.08 : 0.15
-        case .mtp, .mtpHybrid:
-            attempts = quick ? 18 : 70
-            step = quick ? 0.1 : 0.2
-        }
+        let attempts = quick ? 18 : 70
+        let step: TimeInterval = quick ? 0.1 : 0.2
         for i in 0..<attempts {
             if i > 0 {
                 Thread.sleep(forTimeInterval: step)
@@ -691,8 +536,7 @@ final class MountManager {
             guard parts.count == 2,
                   let pid = pid_t(parts[0].trimmingCharacters(in: .whitespaces)) else { continue }
             let cmd = String(parts[1])
-            let hit = (cmd.contains("mtpfuse") || cmd.contains("adbfuse")) && cmd.contains(path)
-            if hit {
+            if cmd.contains("mtpfuse") && cmd.contains(path) {
                 pids.append(pid)
             }
         }
@@ -711,29 +555,12 @@ final class MountManager {
         }
         let exeDir = Bundle.main.bundleURL.deletingLastPathComponent().path
         candidates.append("\(exeDir)/mtpfuse")
+        candidates.append(FileManager.default.currentDirectoryPath + "/build/mtpfuse")
         candidates.append("/usr/local/bin/mtpfuse")
         candidates.append("/opt/homebrew/bin/mtpfuse")
         candidates.append(FileManager.default.currentDirectoryPath + "/mtpfuse")
         let found = candidates.first { fm.isExecutableFile(atPath: $0) }
         cachedMtpfusePath = found
-        return found
-    }
-
-    private func resolvedAdbfusePath() -> String? {
-        if let c = cachedAdbfusePath { return c }
-        let fm = FileManager.default
-        var candidates: [String] = []
-        if let bundleHelper = Bundle.main.url(forAuxiliaryExecutable: "adbfuse")?.path {
-            candidates.append(bundleHelper)
-        }
-        if let res = Bundle.main.resourcePath {
-            candidates.append("\(res)/adbfuse")
-        }
-        let exeDir = Bundle.main.bundleURL.deletingLastPathComponent().path
-        candidates.append("\(exeDir)/adbfuse")
-        candidates.append(FileManager.default.currentDirectoryPath + "/build/adbfuse")
-        let found = candidates.first { fm.isExecutableFile(atPath: $0) }
-        cachedAdbfusePath = found
         return found
     }
 }

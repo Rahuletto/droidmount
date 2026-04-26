@@ -149,5 +149,15 @@ AndroidMount/
 * **`No raw devices found`** when the daemon starts – the phone is
   still in *Charging* mode. Pull down the notification shade on the
   device and switch USB usage to *File Transfer*.
+* **`LIBMTP_Open_Raw_Device` fails** while the phone shows as connected –
+  another app may already hold the MTP USB session (same class of issue
+  [SwiftMTP](https://github.com/Neighbor-Z/SwiftMTP) documents for
+  `LIBUSB_ERROR_NOT_FOUND`): quit **Preview**, **Image Capture**, and
+  **Android File Transfer** (including its background agent in Activity
+  Monitor), then unplug/replug. `mtpfuse` retries detection/open a few
+  times with a short delay to ride out USB settle.
+* **Optional environment (passed to `mtpfuse`):** set `MTP_SKIP_HIDDEN=1`
+  or `MTP_HIDE_DOTFILES=1` to omit device entries whose names start with
+  `.` (Finder-style “no dotfiles” listing; off by default).
 * **Mount appears but is empty** – tap *Allow* on the phone the very
   first time the Mac connects; MTP requires per-host authorization.

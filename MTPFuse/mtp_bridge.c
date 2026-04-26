@@ -26,8 +26,6 @@
 #define _DARWIN_C_SOURCE 1
 #include "mtp_bridge.h"
 
-#include "adb_subprocess.h"
-
 #include <libmtp.h>
 
 #include <errno.h>
@@ -54,8 +52,6 @@ typedef struct mtp_node {
     uint64_t         size;
     uint64_t         mtime;
     int              children_loaded;
-    /* MTP_HYBRID_ADB: Android path prefix for this storage volume (readdir still MTP). */
-    char             hybrid_adb_prefix[512];
     struct mtp_node *parent;
     struct mtp_node *first_child;
     struct mtp_node *next_sibling;
@@ -73,38 +69,31 @@ static pthread_mutex_t     g_mtp    = PTHREAD_MUTEX_INITIALIZER;
 /* -1 = unknown, 0 = no, 1 = yes (LIBMTP_DEVICECAP_GetPartialObject). */
 static int g_cap_partial_get = -1;
 
-/* MTP + ADB hybrid: MTP tree/listing; file bytes via adb when mapped (MTP_HYBRID_ADB=1). */
-static int  g_mtp_hybrid;
-static char g_mtp_hybrid_root[512];
-
 static void log_mtp_errors(void);
-
-static void mtp_hybrid_boot_from_env(void);
-static void mtp_hybrid_shutdown(void);
-static void mtp_hybrid_fill_volume_prefix(mtp_node_t *vol, LIBMTP_devicestorage_t *s, int nstor);
-static int mtp_hybrid_build_abs_for_file_locked(mtp_node_t *f, char *abs_out, size_t abs_cap);
-static int mtp_hybrid_build_abs_for_parent_basename_locked(mtp_node_t *parent_dir, const char *basename,
-                                                           char *abs_out, size_t abs_cap);
-static int mtp_hybrid_try_pread_abs(const char *abs_android, char *buf, size_t size, off_t offset);
 
 /* USB MTP stacks often flake with a single NAK; Finder maps hard I/O failure
  * to “The device disappeared.” Multi-level retries cover long full-file pulls. */
 enum {
-    MTP_USB_RETRIES = 10,
+    /* Inner attempts per libmtp call (NAK / brief stall). */
+    MTP_USB_RETRIES = 16,
     /* Full download restarts after inner retries exhaust (big files often fail near EOF). */
-    MTP_DOWNLOAD_OUTER_WAVES = 3,
+    MTP_DOWNLOAD_OUTER_WAVES = 6,
+    /* Full upload restarts after send or post-send verify fails (truncated object on device). */
+    MTP_SEND_OUTER_WAVES = 5,
 };
 
 static void mtp_usb_backoff(unsigned attempt_1based)
 {
     if (attempt_1based == 0)
         return;
-    /* 100ms … ~2.5s for late attempts (long USB stall / phone power step). */
-    unsigned ms = 100u * (attempt_1based > 16u ? 16u : attempt_1based);
+    /* 100ms … cap at 10s for very long transfers / deep USB sleep. */
+    unsigned ms = 100u * (attempt_1based > 24u ? 24u : attempt_1based);
     if (attempt_1based > 8u)
         ms += 50u * (attempt_1based - 8u);
-    if (ms > 2500u)
-        ms = 2500u;
+    if (attempt_1based > 16u)
+        ms += 100u * (attempt_1based - 16u);
+    if (ms > 10000u)
+        ms = 10000u;
     usleep(ms * 1000u);
 }
 
@@ -166,9 +155,11 @@ static int mtp_get_oid_to_fd_full_retry(uint32_t oid, int fd, uint64_t expect_sz
                     (unsigned long long)st.st_size);
                 continue;
             }
+            /* Metadata often under-reports media size; never trim a longer object. */
             if ((uint64_t)st.st_size > expect_sz) {
-                if (ftruncate(fd, (off_t)expect_sz) < 0)
-                    return -errno;
+                mtp_debug_log("mtp_get_oid_to_fd oid=%u metadata=%llu on_disk=%llu (keep full)",
+                    oid, (unsigned long long)expect_sz,
+                    (unsigned long long)st.st_size);
             }
             return 0;
         }
@@ -176,7 +167,6 @@ static int mtp_get_oid_to_fd_full_retry(uint32_t oid, int fd, uint64_t expect_sz
     return -1;
 }
 
-#ifndef __APPLE__
 /* Returns 0, -ENODEV, or -1 (EIO). Seeks fd to 0 before each attempt. */
 static int mtp_send_file_from_fd_retry(LIBMTP_file_t *meta, int fd)
 {
@@ -200,82 +190,6 @@ static int mtp_send_file_from_fd_retry(LIBMTP_file_t *meta, int fd)
     (void)last;
     return -1;
 }
-#endif
-
-#ifdef __APPLE__
-static int mtp_send_file_from_named_path_retry(LIBMTP_file_t *meta, const char *path)
-{
-    int last = -1;
-    for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
-        if (k > 0)
-            mtp_usb_backoff((unsigned)k);
-        pthread_mutex_lock(&g_mtp);
-        if (!g_device) {
-            pthread_mutex_unlock(&g_mtp);
-            return -ENODEV;
-        }
-        last = LIBMTP_Send_File_From_File(g_device, path, meta, NULL, NULL);
-        pthread_mutex_unlock(&g_mtp);
-        if (last == 0)
-            return 0;
-        log_mtp_errors();
-    }
-    return -1;
-}
-
-/* Robustly copy exactly nbytes from src to dst at current offsets.
- * Returns 0 on success, -EIO on read/write error, -EINTR on signal. */
-static int copy_fd_to_fd_safe(int src, int dst, size_t nbytes)
-{
-    unsigned char buf[256 * 1024];
-    size_t remaining = nbytes;
-    size_t total_copied = 0;
-    
-    while (remaining > 0) {
-        size_t to_read = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
-        ssize_t nread = read(src, buf, to_read);
-        
-        if (nread < 0) {
-            int e = errno;
-            mtp_debug_log("copy_fd_to_fd_safe: read error at offset %zu: %s",
-                         total_copied, strerror(e));
-            return -e;
-        }
-        if (nread == 0) {
-            /* Unexpected EOF before nbytes; this is corruption. */
-            mtp_debug_log("copy_fd_to_fd_safe: unexpected EOF at offset %zu (expected %zu total)",
-                         total_copied, nbytes);
-            return -EIO;
-        }
-        
-        /* Write all bytes read. */
-        size_t to_write = (size_t)nread;
-        size_t written = 0;
-        while (written < to_write) {
-            ssize_t nwrite = write(dst, buf + written, to_write - written);
-            if (nwrite < 0) {
-                int e = errno;
-                mtp_debug_log("copy_fd_to_fd_safe: write error at offset %zu: %s",
-                             total_copied + written, strerror(e));
-                return -e;
-            }
-            if (nwrite == 0) {
-                /* write() returned 0; unusual but treat as error. */
-                mtp_debug_log("copy_fd_to_fd_safe: write returned 0 at offset %zu",
-                             total_copied + written);
-                return -EIO;
-            }
-            written += (size_t)nwrite;
-        }
-        
-        remaining -= (size_t)nread;
-        total_copied += (size_t)nread;
-    }
-    
-    mtp_debug_log("copy_fd_to_fd_safe: copied %zu bytes successfully", total_copied);
-    return 0;
-}
-#endif
 
 static int mtp_delete_object_retry(uint32_t oid)
 {
@@ -298,21 +212,18 @@ static int mtp_delete_object_retry(uint32_t oid)
     return -1;
 }
 
-/* Refresh size + modification time from the device when the directory
- * listing left them unset (common for some stacks). Caller must hold g_lock;
- * briefly takes g_mtp (same nesting order as load_children). */
+/* Refresh size + modification time from the device. Caller must hold g_lock;
+ * briefly takes g_mtp (same nesting order as load_children).
+ *
+ * Always re-query files by object id: many stacks (especially for video) report
+ * plausible but wrong non-zero sizes in cached tree state. Using that for
+ * GetPartialObject length or for post-download ftruncate produces truncated
+ * MP4/MOV bytes — QuickTime and on-device players then fail. */
 static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
 {
-    /* Folders often have mtime==0 on MTP; Get_Filemetadata per folder during
-     * readdir/stat was stalling listings and could leave Finder showing an
-     * empty volume. Files still refresh when the listing left size/time unset.
-     * Some stacks report size=0 in Get_Children metadata but a non-zero mtime;
-     * Quick Look then shows "Zero KB" until we re-query by object id. */
     if (!n || n->is_synth)
         return;
     if (n->object_id == 0 || n->is_dir)
-        return;
-    if (n->mtime != 0 && n->size != 0u)
         return;
     pthread_mutex_lock(&g_mtp);
     if (!g_device) {
@@ -336,6 +247,10 @@ static mtp_node_t *node_new(const char *name, int is_dir,
     mtp_node_t *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
     n->name = strdup(name ? name : "");
+    if (!n->name) {
+        free(n);
+        return NULL;
+    }
     n->object_id = oid;
     n->storage_id = sid;
     n->is_dir = is_dir;
@@ -345,6 +260,16 @@ static mtp_node_t *node_new(const char *name, int is_dir,
 static void node_free(mtp_node_t *n)
 {
     if (!n) return;
+    /* Unlink from parent when still in-tree (caller may have cleared parent->first_child first). */
+    if (n->parent) {
+        mtp_node_t **slot = &n->parent->first_child;
+        while (*slot && *slot != n)
+            slot = &(*slot)->next_sibling;
+        if (*slot)
+            *slot = n->next_sibling;
+        n->next_sibling = NULL;
+        n->parent = NULL;
+    }
     mtp_node_t *c = n->first_child;
     while (c) {
         mtp_node_t *nx = c->next_sibling;
@@ -357,6 +282,8 @@ static void node_free(mtp_node_t *n)
 
 static void node_add_child(mtp_node_t *parent, mtp_node_t *child)
 {
+    if (!parent || !child)
+        return;
     child->parent = parent;
     child->next_sibling = parent->first_child;
     parent->first_child = child;
@@ -364,8 +291,10 @@ static void node_add_child(mtp_node_t *parent, mtp_node_t *child)
 
 static mtp_node_t *node_find_child(mtp_node_t *parent, const char *name)
 {
+    if (!parent || !name)
+        return NULL;
     for (mtp_node_t *c = parent->first_child; c; c = c->next_sibling) {
-        if (strcmp(c->name, name) == 0) return c;
+        if (c->name && strcmp(c->name, name) == 0) return c;
     }
     return NULL;
 }
@@ -381,6 +310,20 @@ static uint32_t mtp_parent_handle(const mtp_node_t *folder)
     if (folder->object_id == 0 && folder->storage_id != 0)
         return LIBMTP_FILES_AND_FOLDERS_ROOT;
     return folder->object_id;
+}
+
+/* Nested folder nodes often have storage_id 0; Move_Object needs the real volume id. */
+static uint32_t node_effective_storage_id(const mtp_node_t *n)
+{
+    if (!n)
+        return 0u;
+    if (n->storage_id != 0u)
+        return n->storage_id;
+    for (mtp_node_t *w = n->parent; w; w = w->parent) {
+        if (w->storage_id != 0u)
+            return w->storage_id;
+    }
+    return 0u;
 }
 
 static double now_sec(void)
@@ -500,244 +443,26 @@ static void dir_drop_children_locked(mtp_node_t *dir)
     }
 }
 
-static void mtp_hybrid_boot_from_env(void)
+/* SwiftMTP FAQ: exclusive MTP session — same idea as Kalam/OpenMTP “close other holders”. */
+static void mtp_print_mtp_session_hint(void)
 {
-    g_mtp_hybrid = 0;
-    g_mtp_hybrid_root[0] = '\0';
-    const char *hy = getenv("MTP_HYBRID_ADB");
-    if (!hy || !hy[0] || strcmp(hy, "0") == 0)
-        return;
-    adb_set_serial_from_env();
-    if (!adb_serial() || !adb_serial()[0])
-        return;
-    char out[512];
-    size_t len = 0;
-    const char *av[] = { "shell", "printenv", "EXTERNAL_STORAGE", NULL };
-    if (adb_run_capture(av, out, sizeof out, &len, 8) == 0 && len > 0) {
-        while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
-            out[--len] = '\0';
-        if (len > 0 && out[0] == '/')
-            snprintf(g_mtp_hybrid_root, sizeof g_mtp_hybrid_root, "%s", out);
-    }
-    if (!g_mtp_hybrid_root[0])
-        snprintf(g_mtp_hybrid_root, sizeof g_mtp_hybrid_root, "%s", "/storage/emulated/0");
-    g_mtp_hybrid = 1;
-    fprintf(stderr, "mtp_hybrid: MTP folders + ADB file I/O (ANDROID path root=%s)\n", g_mtp_hybrid_root);
+    fprintf(stderr,
+            "mtp_open: If the device is connected, another app may be holding the MTP USB session.\n"
+            "  Quit Preview, Image Capture, and Android File Transfer (also its background agent in\n"
+            "  Activity Monitor), then unplug/replug or retry.\n");
     fflush(stderr);
 }
 
-static void mtp_hybrid_shutdown(void)
+static int mtp_skip_hidden_dot_filenames(void)
 {
-    g_mtp_hybrid = 0;
-    g_mtp_hybrid_root[0] = '\0';
-}
-
-static void mtp_hybrid_fill_volume_prefix(mtp_node_t *vol, LIBMTP_devicestorage_t *s, int nstor)
-{
-    if (!vol)
-        return;
-    vol->hybrid_adb_prefix[0] = '\0';
-    if (!g_mtp_hybrid || !s)
-        return;
-    const char *desc = s->StorageDescription;
-    int looks_sd = 0;
-    if (desc) {
-        if (strcasestr(desc, "SD"))
-            looks_sd = 1;
-        if (strcasestr(desc, "Card"))
-            looks_sd = 1;
-        if (strcasestr(desc, "Portable"))
-            looks_sd = 1;
-    }
-    if (nstor <= 1 || !looks_sd) {
-        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
-        return;
-    }
-    char list[4096];
-    size_t ln = 0;
-    const char *lsav[] = { "shell", "ls", "-1", "/storage", NULL };
-    if (adb_run_capture(lsav, list, sizeof list, &ln, 12) != 0 || ln == 0) {
-        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
-        return;
-    }
-    list[sizeof(list) - 1] = '\0';
-    char *save = NULL;
-    for (char *line = strtok_r(list, "\n\r", &save); line; line = strtok_r(NULL, "\n\r", &save)) {
-        if (!line[0])
-            continue;
-        if (strcmp(line, "emulated") == 0 || strcmp(line, "self") == 0)
-            continue;
-        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "/storage/%s", line);
-        return;
-    }
-    snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
-}
-
-static int mtp_hybrid_build_abs_for_file_locked(mtp_node_t *f, char *abs_out, size_t abs_cap)
-{
-    if (!f || f->is_dir || !abs_out || abs_cap < 8)
-        return -1;
-    mtp_node_t *vol = f;
-    while (vol->parent && vol->parent != g_root)
-        vol = vol->parent;
-    if (!vol->parent || vol->parent != g_root || vol == g_root)
-        return -1;
-    if (!vol->hybrid_adb_prefix[0])
-        return -1;
-    mtp_node_t *stack[128];
-    int sp = 0;
-    for (mtp_node_t *x = f; x && x != vol; x = x->parent) {
-        if (sp >= 128)
-            return -1;
-        stack[sp++] = x;
-    }
-    if (vol == f) {
-        /* file cannot be volume node */
-        return -1;
-    }
-    char rel[4096];
-    rel[0] = '\0';
-    for (int i = sp - 1; i >= 0; i--) {
-        if (rel[0]) {
-            if (strlcat(rel, "/", sizeof rel) >= sizeof rel)
-                return -1;
-        }
-        if (strlcat(rel, stack[i]->name, sizeof rel) >= sizeof rel)
-            return -1;
-    }
-    if (rel[0]) {
-        if ((size_t)snprintf(abs_out, abs_cap, "%s/%s", vol->hybrid_adb_prefix, rel) >= abs_cap)
-            return -1;
-    } else {
-        if ((size_t)snprintf(abs_out, abs_cap, "%s", vol->hybrid_adb_prefix) >= abs_cap)
-            return -1;
-    }
-    return 0;
-}
-
-static int mtp_hybrid_build_abs_for_parent_basename_locked(mtp_node_t *parent_dir, const char *basename,
-                                                           char *abs_out, size_t abs_cap)
-{
-    if (!parent_dir || !basename || !basename[0] || !abs_out || abs_cap < 8)
-        return -1;
-    mtp_node_t *vol = parent_dir;
-    while (vol->parent && vol->parent != g_root)
-        vol = vol->parent;
-    if (!vol->parent || vol->parent != g_root || vol == g_root)
-        return -1;
-    if (!vol->hybrid_adb_prefix[0])
-        return -1;
-    mtp_node_t *stack[128];
-    int sp = 0;
-    for (mtp_node_t *x = parent_dir; x && x != vol; x = x->parent) {
-        if (sp >= 128)
-            return -1;
-        stack[sp++] = x;
-    }
-    char rel[4096];
-    rel[0] = '\0';
-    for (int i = sp - 1; i >= 0; i--) {
-        if (rel[0]) {
-            if (strlcat(rel, "/", sizeof rel) >= sizeof rel)
-                return -1;
-        }
-        if (strlcat(rel, stack[i]->name, sizeof rel) >= sizeof rel)
-            return -1;
-    }
-    if (rel[0]) {
-        if (snprintf(abs_out, abs_cap, "%s/%s/%s", vol->hybrid_adb_prefix, rel, basename) >= (int)abs_cap)
-            return -1;
-    } else {
-        if (snprintf(abs_out, abs_cap, "%s/%s", vol->hybrid_adb_prefix, basename) >= (int)abs_cap)
-            return -1;
-    }
-    return 0;
-}
-
-static int mtp_hybrid_shell_quote_path(const char *path, char *out, size_t cap)
-{
-    size_t o = 0;
-    if (o + 1 >= cap)
-        return -1;
-    out[o++] = '\'';
-    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-        if (*p == '\'') {
-            if (o + 4 >= cap)
-                return -1;
-            memcpy(out + o, "'\\''", 4);
-            o += 4;
-        } else {
-            if (o + 1 >= cap)
-                return -1;
-            out[o++] = (char)*p;
-        }
-    }
-    if (o + 2 > cap)
-        return -1;
-    out[o++] = '\'';
-    out[o] = '\0';
-    return 0;
-}
-
-/* Prefer block-aligned `dd` for large reads (one adb exec-out vs tail|head per call).
- * Unaligned offsets or small reads use `tail|head` (less read-ahead waste). */
-static int mtp_hybrid_try_pread_abs(const char *abs_android, char *buf, size_t size, off_t offset)
-{
-    if (!abs_android || !abs_android[0] || size == 0)
-        return -EIO;
-    if (offset < 0)
-        return -EINVAL;
-
-    const uint64_t BS = 1048576ULL; /* 1 MiB — matches typical FUSE iosize */
-    uint64_t off = (uint64_t)offset;
-
-    char esc[3072];
-    if (mtp_hybrid_shell_quote_path(abs_android, esc, sizeof esc) != 0)
-        return -EIO;
-
-    if (off % BS == 0 && size >= 65536u) {
-        uint64_t skip_blk = off / BS;
-        uint64_t nblks = ((uint64_t)size + BS - 1) / BS;
-        uint64_t out_bytes = nblks * BS;
-        /* Cap read-ahead so we do not malloc huge buffers on tiny tail waste edge cases. */
-        if (out_bytes <= 8u * 1024u * 1024u && nblks > 0) {
-            char script[6400];
-            int sn = snprintf(script, sizeof script,
-                              "dd if=%s bs=%llu skip=%llu count=%llu 2>/dev/null",
-                              esc, (unsigned long long)BS, (unsigned long long)skip_blk,
-                              (unsigned long long)nblks);
-            if (sn > 0 && sn < (int)sizeof script) {
-                unsigned char *tmp = (unsigned char *)malloc((size_t)out_bytes);
-                if (tmp) {
-                    int tmo = 60 + (int)((out_bytes / (1024u * 1024u)) * 30u);
-                    if (tmo > 480)
-                        tmo = 480;
-                    size_t got = 0;
-                    int rc = adb_exec_out_script_read(script, tmp, (size_t)out_bytes, tmo, &got);
-                    if (rc == 0 && got > 0) {
-                        size_t copy = got;
-                        if (copy > size)
-                            copy = size;
-                        memcpy(buf, tmp, copy);
-                        free(tmp);
-                        return (int)copy;
-                    }
-                    free(tmp);
-                }
-            }
-        }
-    }
-
-    unsigned long long start_byte = off + 1ULL;
-    char script[6400];
-    if (snprintf(script, sizeof script,
-                 "tail -c +%llu %s 2>/dev/null | head -c %zu 2>/dev/null",
-                 start_byte, esc, size) >= (int)sizeof script)
-        return -EIO;
-    size_t got = 0;
-    if (adb_exec_out_script_read(script, (unsigned char *)buf, size, 120, &got) != 0)
-        return -EIO;
-    return (int)got;
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    const char *a = getenv("MTP_SKIP_HIDDEN");
+    const char *b = getenv("MTP_HIDE_DOTFILES");
+    int on = (a && a[0] && strcmp(a, "0") != 0) || (b && b[0] && strcmp(b, "0") != 0);
+    cached = on ? 1 : 0;
+    return cached;
 }
 
 /* Caller must hold g_lock for the whole call; do not drop it here.
@@ -756,9 +481,6 @@ static void load_children(mtp_node_t *dir)
             dir->children_loaded = 1;
             return;
         }
-        int nstor = 0;
-        for (LIBMTP_devicestorage_t *sx = g_device->storage; sx; sx = sx->next)
-            nstor++;
         /* Some phones report NULL/duplicate StorageDescription for multiple
          * volumes; skipping the second hid entire storages (e.g. only “SD card”). */
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -792,11 +514,8 @@ static void load_children(mtp_node_t *dir)
                     mtp_debug_log("[LOAD] root storage label sid=%u: \"%s\" → \"%s\"", s->id,
                                   base, vlabel);
                 mtp_node_t *n = node_new(vlabel, 1, 0, s->id);
-                if (n) {
-                    if (g_mtp_hybrid)
-                        mtp_hybrid_fill_volume_prefix(n, s, nstor);
+                if (n)
                     node_add_child(dir, n);
-                }
             }
             if (dir->first_child)
                 break;
@@ -895,6 +614,7 @@ static void load_children(mtp_node_t *dir)
         if (file) {
             int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
             if (file->filename && file->filename[0] &&
+                !(mtp_skip_hidden_dot_filenames() && file->filename[0] == '.') &&
                 !node_find_child(dir, file->filename)) {
                 mtp_node_t *n = node_new(file->filename, is_dir,
                                          file->item_id, file->storage_id);
@@ -1004,6 +724,7 @@ static void mtp_synth_attach_volume_meta(mtp_node_t *vol)
 static mtp_node_t *resolve(const char *path)
 {
     if (!path || path[0] != '/') return NULL;
+    if (strlen(path) >= PATH_MAX) return NULL;
     if (path[1] == '\0') return g_root;
 
     mtp_node_t *cur = g_root;
@@ -1095,73 +816,89 @@ static int pick_raw_device_index(LIBMTP_raw_device_t *raw, int n_raw)
 
 int mtp_open(void)
 {
+    enum { MTP_OPEN_ATTEMPTS = 4 };
+
     setvbuf(stderr, NULL, _IOLBF, 0);
     mtp_debug_log("mtp_open: LIBMTP_Init");
     fprintf(stderr, "mtp_open: LIBMTP_Init...\n"); fflush(stderr);
     LIBMTP_Init();
-    mtp_debug_log("mtp_open: Detect_Raw_Devices");
-    fprintf(stderr, "mtp_open: detecting raw devices...\n"); fflush(stderr);
 
-    /* Use the more explicit detection API so we can give better
-     * diagnostics than Get_First_Device() (which silently swallows
-     * everything and returns NULL on any error). */
-    LIBMTP_raw_device_t *raw = NULL;
-    int n_raw = 0;
-    LIBMTP_error_number_t err = LIBMTP_Detect_Raw_Devices(&raw, &n_raw);
-    mtp_debug_log("mtp_open: detect err=%d n_raw=%d", (int)err, n_raw);
-    fprintf(stderr, "mtp_open: detect returned err=%d, n=%d\n", err, n_raw); fflush(stderr);
-    if (err != LIBMTP_ERROR_NONE || n_raw == 0) {
-        fprintf(stderr, "mtp_open: no MTP device found "
-                        "(is the phone unlocked and in File Transfer mode?)\n");
+    for (int attempt = 0; attempt < MTP_OPEN_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            fprintf(stderr, "mtp_open: retry %d/%d (USB settle / release MTP session)...\n",
+                    attempt, MTP_OPEN_ATTEMPTS - 1);
+            fflush(stderr);
+            usleep(1500000);
+        }
+
+        mtp_debug_log("mtp_open: Detect_Raw_Devices (attempt %d)", attempt);
+        fprintf(stderr, "mtp_open: detecting raw devices...\n"); fflush(stderr);
+
+        LIBMTP_raw_device_t *raw = NULL;
+        int n_raw = 0;
+        LIBMTP_error_number_t err = LIBMTP_Detect_Raw_Devices(&raw, &n_raw);
+        mtp_debug_log("mtp_open: detect err=%d n_raw=%d", (int)err, n_raw);
+        fprintf(stderr, "mtp_open: detect returned err=%d, n=%d\n", err, n_raw); fflush(stderr);
+
+        if (err != LIBMTP_ERROR_NONE || n_raw == 0) {
+            free(raw);
+            if (attempt == MTP_OPEN_ATTEMPTS - 1) {
+                fprintf(stderr, "mtp_open: no MTP device found "
+                                "(unlock phone, enable File Transfer / MTP)\n");
+                mtp_print_mtp_session_hint();
+            }
+            continue;
+        }
+
+        int ri = pick_raw_device_index(raw, n_raw);
+        mtp_debug_log("mtp_open: Open_Raw_Device_Uncached raw[%d] VID=%04x PID=%04x "
+                      "bus_location=0x%x",
+                      ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
+                      raw[ri].bus_location);
+        fprintf(stderr, "mtp_open: opening raw device %d (VID=%04x PID=%04x bus=0x%x)...\n",
+                ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
+                raw[ri].bus_location);
+        fflush(stderr);
+        g_device = LIBMTP_Open_Raw_Device_Uncached(&raw[ri]);
         free(raw);
-        return -1;
-    }
-    int ri = pick_raw_device_index(raw, n_raw);
-    mtp_debug_log("mtp_open: Open_Raw_Device_Uncached raw[%d] VID=%04x PID=%04x "
-                  "bus_location=0x%x",
-                  ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
-                  raw[ri].bus_location);
-    fprintf(stderr, "mtp_open: opening raw device %d (VID=%04x PID=%04x bus=0x%x)...\n",
-            ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
-            raw[ri].bus_location);
-    fflush(stderr);
-    g_device = LIBMTP_Open_Raw_Device_Uncached(&raw[ri]);
-    free(raw);
-    if (!g_device) {
-        mtp_debug_log("mtp_open: Open_Raw_Device failed");
-        fprintf(stderr, "mtp_open: LIBMTP_Open_Raw_Device failed\n");
-        return -1;
-    }
-    char *name  = LIBMTP_Get_Friendlyname(g_device);
-    char *model = LIBMTP_Get_Modelname(g_device);
-    mtp_debug_log("mtp_open: connected name=%s model=%s",
-                  name ? name : "?", model ? model : "?");
-    fprintf(stderr, "mtp_open: connected to %s (%s)\n",
-            name  ? name  : "?",
-            model ? model : "?");
-    fflush(stderr);
-    free(name); free(model);
+        if (!g_device) {
+            mtp_debug_log("mtp_open: Open_Raw_Device failed (attempt %d)", attempt);
+            fprintf(stderr, "mtp_open: LIBMTP_Open_Raw_Device_Uncached failed\n");
+            if (attempt == MTP_OPEN_ATTEMPTS - 1)
+                mtp_print_mtp_session_hint();
+            continue;
+        }
 
-    /* Force-update storage list so we can enumerate volumes. */
-    mtp_debug_log("mtp_open: Get_Storage");
-    fprintf(stderr, "mtp_open: enumerating storage...\n"); fflush(stderr);
-    LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
-    fprintf(stderr, "mtp_open: ready\n"); fflush(stderr);
+        char *name  = LIBMTP_Get_Friendlyname(g_device);
+        char *model = LIBMTP_Get_Modelname(g_device);
+        mtp_debug_log("mtp_open: connected name=%s model=%s",
+                      name ? name : "?", model ? model : "?");
+        fprintf(stderr, "mtp_open: connected to %s (%s)\n",
+                name  ? name  : "?",
+                model ? model : "?");
+        fflush(stderr);
+        free(name); free(model);
 
-    g_root = node_new("", 1, 0, 0);
-    if (!g_root) {
-        mtp_debug_log("mtp_open: node_new(root) failed");
-        fprintf(stderr, "mtp_open: out of memory building root node\n");
-        LIBMTP_Release_Device(g_device);
-        g_device = NULL;
-        return -1;
-    }
-    mtp_debug_log("mtp_open: success g_root=%p", (void *)g_root);
+        mtp_debug_log("mtp_open: Get_Storage");
+        fprintf(stderr, "mtp_open: enumerating storage...\n"); fflush(stderr);
+        LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
+        fprintf(stderr, "mtp_open: ready\n"); fflush(stderr);
+
+        g_root = node_new("", 1, 0, 0);
+        if (!g_root) {
+            mtp_debug_log("mtp_open: node_new(root) failed");
+            fprintf(stderr, "mtp_open: out of memory building root node\n");
+            LIBMTP_Release_Device(g_device);
+            g_device = NULL;
+            return -1;
+        }
+        mtp_debug_log("mtp_open: success g_root=%p", (void *)g_root);
 #if defined(__APPLE__)
-    mtp_cache_volume_icon_path_from_env();
+        mtp_cache_volume_icon_path_from_env();
 #endif
-    mtp_hybrid_boot_from_env();
-    return 0;
+        return 0;
+    }
+    return -1;
 }
 
 void mtp_set_fuse_mount_point(const char *mountpoint)
@@ -1219,7 +956,6 @@ static const char *mtp_path_for_tree(const char *path, char *norm_buf, size_t no
 void mtp_close(void)
 {
     mtp_debug_log("mtp_close: begin (release tree + device)");
-    mtp_hybrid_shutdown();
     pthread_mutex_lock(&g_lock);
 #if defined(__APPLE__)
     g_volicon_src[0] = '\0';
@@ -1317,6 +1053,49 @@ int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t
     *total_bytes = tot;
     *free_bytes = fr;
     return 0;
+}
+
+/* [storage_ref_path] must resolve under the target volume (e.g. parent dir of the file).
+ * [bytes_reclaimed_if_replace] is the current on-device size of an object we will delete first. */
+static int mtp_precheck_upload_space(const char *storage_ref_path,
+    uint64_t upload_bytes, uint64_t bytes_reclaimed_if_replace)
+{
+    uint64_t total = 0, freeb = 0;
+    int rc = mtp_storage_space_for_path(storage_ref_path, &total, &freeb);
+    if (rc != 0)
+        return rc;
+    uint64_t need = upload_bytes + 65536u; /* MTP / allocator slack */
+    if (need < upload_bytes)
+        return -EFBIG;
+    uint64_t avail = freeb + bytes_reclaimed_if_replace;
+    if (need > avail) {
+        fprintf(stderr,
+            "mtpfuse: No disk storage on your Android device (need %llu bytes, %llu available).\n",
+            (unsigned long long)need, (unsigned long long)avail);
+        mtp_debug_log("mtp_precheck_upload_space ENOSPC ref=%s need=%llu avail=%llu reclaim=%llu",
+            storage_ref_path, (unsigned long long)need, (unsigned long long)avail,
+            (unsigned long long)bytes_reclaimed_if_replace);
+        return -ENOSPC;
+    }
+    return 0;
+}
+
+void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx), void *ctx)
+{
+    if (!cb)
+        return;
+    pthread_mutex_lock(&g_lock);
+    if (g_root) {
+        for (mtp_node_t *c = g_root->first_child; c; c = c->next_sibling) {
+            if (!c->is_dir || !c->name || !c->name[0] || c->is_synth)
+                continue;
+            char buf[PATH_MAX];
+            if (snprintf(buf, sizeof buf, "/%s", c->name) >= (int)sizeof buf)
+                continue;
+            cb(buf, ctx);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 
 int mtp_stat(const char *path, mtp_stat_t *out)
@@ -1472,8 +1251,8 @@ int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
     if (size == 0)
         return 0;
 
-    /* PTP max chunk is uint32; align with mount iosize=1MiB for fewer round-trips. */
-    const uint32_t chunk_max = 1048576u;
+    /* PTP chunk size: 2MiB caps round-trips on long reads while staying below typical firmware limits. */
+    const uint32_t chunk_max = 2097152u;
     uint32_t req = (size > (size_t)chunk_max) ? chunk_max : (uint32_t)size;
 
     for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
@@ -1494,6 +1273,17 @@ int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
                 got = req;
             if (got > size)
                 got = (unsigned int)size;
+            /* Short reads mid-file are almost always USB flake — retry instead of returning
+             * a truncated buffer (corrupts copies at TB scale). EOF tail may be short. */
+            uint64_t endpos = (uint64_t)offset + (uint64_t)got;
+            int at_eof = endpos >= file_size;
+            if (!at_eof && got < req) {
+                free(data);
+                mtp_debug_log("mtp_read_partial: short mid-file oid=%u off=%llu got=%u want=%u → retry",
+                              oid, (unsigned long long)offset, got, req);
+                log_mtp_errors();
+                continue;
+            }
             memcpy(buf, data, got);
             free(data);
             return (int)got;
@@ -1527,52 +1317,12 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
         return mtp_volicon_pread(buf, size, offset);
     }
 #endif
-    char hy_abs[4096];
-    int hy_ready = 0;
-    if (g_mtp_hybrid)
-        hy_ready = (mtp_hybrid_build_abs_for_file_locked(n, hy_abs, sizeof hy_abs) == 0);
     uint32_t oid = n->object_id;
     uint64_t total = n->size;
     pthread_mutex_unlock(&g_lock);
 
     if ((uint64_t)offset >= total) return 0;
     if (offset + size > total) size = (size_t)(total - offset);
-
-    if (hy_ready) {
-        int hr = -1;
-        for (int att = 0; att < 3; att++) {
-            if (att > 0)
-                usleep(45000);
-            hr = mtp_hybrid_try_pread_abs(hy_abs, buf, size, offset);
-            if (hr > 0) {
-                if ((size_t)hr == size) {
-                    mtp_debug_log("mtp_read hybrid path=%s ret=%d dt=%.3fs", path, hr, now_sec() - t0);
-                    return hr;
-                }
-                /* Short read: OK at EOF; otherwise ADB flake vs MTP tree — refill via MTP. */
-                if ((uint64_t)offset + (size_t)hr >= total) {
-                    mtp_debug_log("mtp_read hybrid path=%s ret=%d (EOF tail) dt=%.3fs", path, hr,
-                                  now_sec() - t0);
-                    return hr;
-                }
-                mtp_debug_log("mtp_read hybrid short mid-file path=%s got=%d want=%zu off=%llu → MTP",
-                              path, hr, size, (unsigned long long)offset);
-                break;
-            }
-            if (hr == 0) {
-                if ((uint64_t)offset >= total)
-                    return 0;
-                mtp_debug_log("mtp_read hybrid zero bytes path=%s off=%llu att=%d", path,
-                              (unsigned long long)offset, att);
-                continue;
-            }
-            if (att == 2)
-                mtp_debug_log("mtp_read hybrid adb miss path=%s rc=%d → MTP", path, hr);
-        }
-        if (hr == 0 && (uint64_t)offset < total)
-            mtp_debug_log("mtp_read hybrid zero after retries path=%s off=%llu → MTP", path,
-                          (unsigned long long)offset);
-    }
 
     mtp_debug_log("mtp_read begin path=%s oid=%u off=%lld sz=%zu file_sz=%llu",
                   path, oid, (long long)offset, size, (unsigned long long)total);
@@ -1645,10 +1395,6 @@ int mtp_download_to_fd(const char *path, int fd)
         return (cr == 0) ? 0 : cr;
     }
 #endif
-    char hy_abs[4096];
-    int hy_ready = 0;
-    if (g_mtp_hybrid)
-        hy_ready = (mtp_hybrid_build_abs_for_file_locked(n, hy_abs, sizeof hy_abs) == 0);
     uint32_t oid = n->object_id;
     node_refresh_meta_if_stale_locked(n);
     uint64_t expect = n->size;
@@ -1658,23 +1404,6 @@ int mtp_download_to_fd(const char *path, int fd)
         return -errno;
     if (lseek(fd, 0, SEEK_SET) < 0)
         return -errno;
-
-    if (hy_ready) {
-        int ar = adb_exec_out_cat_to_fd(hy_abs, fd, 7200);
-        if (ar == 0) {
-            struct stat st;
-            int fs = fstat(fd, &st);
-            if (fs == 0 && (uint64_t)st.st_size == expect)
-                return 0;
-            long long got_sz = (fs == 0) ? (long long)st.st_size : -1LL;
-            if (ftruncate(fd, 0) < 0)
-                return -errno;
-            if (lseek(fd, 0, SEEK_SET) < 0)
-                return -errno;
-            mtp_debug_log("mtp_download_to_fd hybrid size mismatch expect=%llu got=%lld → MTP",
-                          (unsigned long long)expect, got_sz);
-        }
-    }
 
     mtp_debug_log("mtp_download_to_fd path=%s oid=%u expect=%llu", path, oid,
                   (unsigned long long)expect);
@@ -1720,7 +1449,7 @@ static void tree_detach(mtp_node_t *n)
     }
 }
 
-/* UNKNOWN works on many phones; some stacks mis-index video until format is set. */
+/* UNKNOWN works on many phones; explicit MP4 type has triggered bad objects on some stacks. */
 static LIBMTP_filetype_t guess_filetype_from_basename(const char *base)
 {
     const char *dot = strrchr(base, '.');
@@ -1728,7 +1457,7 @@ static LIBMTP_filetype_t guess_filetype_from_basename(const char *base)
         return LIBMTP_FILETYPE_UNKNOWN;
     const char *e = dot + 1;
     if (strcasecmp(e, "mp4") == 0 || strcasecmp(e, "m4v") == 0)
-        return LIBMTP_FILETYPE_MP4;
+        return LIBMTP_FILETYPE_UNKNOWN;
     if (strcasecmp(e, "mov") == 0)
         return LIBMTP_FILETYPE_QT;
     if (strcasecmp(e, "m4a") == 0)
@@ -1746,10 +1475,91 @@ static LIBMTP_filetype_t guess_filetype_from_basename(const char *base)
     return LIBMTP_FILETYPE_UNKNOWN;
 }
 
+/* Compare first and last ~256KiB on device vs host fd. Catches same-size corruption that
+ * still breaks QuickTime / on-device players. Requires GetPartialObject. */
+static int mtp_verify_upload_head_tail_vs_fd(uint32_t oid, int fd, size_t size)
+{
+    if (size == 0 || oid == 0u)
+        return 0;
+    const uint32_t chk = 262144u;
+    size_t n = (size < (size_t)chk) ? size : (size_t)chk;
+    unsigned char *host = (unsigned char *)malloc(n);
+    if (!host)
+        return -1;
+    if (pread(fd, host, n, 0) != (ssize_t)n) {
+        free(host);
+        return -1;
+    }
+    int ok = -1;
+    for (unsigned attempt = 0; attempt < 8u; attempt++) {
+        if (attempt > 0)
+            mtp_usb_backoff(attempt);
+        unsigned char *data = NULL;
+        unsigned int got = 0;
+        pthread_mutex_lock(&g_mtp);
+        if (!g_device) {
+            pthread_mutex_unlock(&g_mtp);
+            free(host);
+            return -1;
+        }
+        int lr = LIBMTP_GetPartialObject(g_device, oid, 0, (uint32_t)n, &data, &got);
+        pthread_mutex_unlock(&g_mtp);
+        if (lr == 0 && data && got == n && memcmp(host, data, n) == 0) {
+            free(data);
+            ok = 0;
+            break;
+        }
+        if (data)
+            free(data);
+    }
+    if (ok != 0) {
+        mtp_debug_log("mtp_verify_upload: head mismatch oid=%u n=%zu", oid, n);
+        free(host);
+        return -1;
+    }
+    if (size > (size_t)chk) {
+        uint64_t off = (uint64_t)size - (uint64_t)chk;
+        if (pread(fd, host, (size_t)chk, (off_t)off) != (ssize_t)chk) {
+            free(host);
+            return -1;
+        }
+        ok = -1;
+        for (unsigned attempt = 0; attempt < 8u; attempt++) {
+            if (attempt > 0)
+                mtp_usb_backoff(attempt);
+            unsigned char *data = NULL;
+            unsigned int got = 0;
+            pthread_mutex_lock(&g_mtp);
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                free(host);
+                return -1;
+            }
+            int lr = LIBMTP_GetPartialObject(g_device, oid, off, chk, &data, &got);
+            pthread_mutex_unlock(&g_mtp);
+            if (lr == 0 && data && got == chk && memcmp(host, data, chk) == 0) {
+                free(data);
+                ok = 0;
+                break;
+            }
+            if (data)
+                free(data);
+        }
+        if (ok != 0) {
+            mtp_debug_log("mtp_verify_upload: tail mismatch oid=%u off=%llu", oid,
+                          (unsigned long long)off);
+            free(host);
+            return -1;
+        }
+    }
+    free(host);
+    mtp_debug_log("mtp_verify_upload: OK oid=%u size=%zu", oid, size);
+    return 0;
+}
+
 /* Send file bytes from fd (at current offset 0, length size) to MTP at path.
- * Returns 0 on success, -errno on error. On macOS, creates a temporary snapshot
- * file to work around libmtp fd-based send limitations. Automatically deletes
- * existing files before creating new ones to ensure clean overwrites. */
+ * Returns 0 on success, -errno on error. Streams via LIBMTP_Send_File_From_File_Descriptor
+ * (no extra /tmp copy of the payload on upload). */
 static int mtp_write_send_fd(const char *path, int fd, size_t size)
 {
     char norm_buf[PATH_MAX];
@@ -1791,25 +1601,26 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     /* Check for existing file to replace. */
     uint32_t replace_oid = 0;
     mtp_node_t *existing = node_find_child(parent_node, basename);
+    uint64_t reclaim_replace = 0;
     if (existing && !existing->is_dir) {
         replace_oid = existing->object_id;
+        node_refresh_meta_if_stale_locked(existing);
+        reclaim_replace = existing->size;
         mtp_debug_log("mtp_write_send_fd: replacing existing file object_id=%u", replace_oid);
-    }
-
-    char hy_abs[4096];
-    int hy_dest = 0;
-    if (g_mtp_hybrid) {
-        if (replace_oid && existing && !existing->is_dir)
-            hy_dest = (mtp_hybrid_build_abs_for_file_locked(existing, hy_abs, sizeof hy_abs) == 0);
-        else if (!replace_oid)
-            hy_dest = (mtp_hybrid_build_abs_for_parent_basename_locked(parent_node, basename, hy_abs,
-                                                                      sizeof hy_abs) == 0);
     }
 
     pthread_mutex_unlock(&g_lock);
 
-    /* Delete existing MTP object unless hybrid will overwrite the same path via adb. */
-    if (replace_oid && !hy_dest) {
+    {
+        int pre = mtp_precheck_upload_space(parent_path, (uint64_t)size, reclaim_replace);
+        if (pre != 0) {
+            free(path_dup);
+            return pre;
+        }
+    }
+
+    /* Delete existing MTP object so the new upload is a clean replace. */
+    if (replace_oid) {
         int dr = mtp_delete_object_retry(replace_oid);
         if (dr == -ENODEV) {
             free(path_dup);
@@ -1820,8 +1631,8 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
             free(path_dup);
             return -EIO;
         }
-        /* Device stacks need time to process deletion. */
-        usleep(500000);
+        /* Brief settle; long sleeps kept Finder at “Preparing” with no byte progress. */
+        usleep(50000);
     }
 
     /* Ensure fd is at offset 0 with pending writes flushed. */
@@ -1848,260 +1659,106 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
         }
     }
 
-    /* Create libmtp file metadata. */
-    LIBMTP_file_t *meta = LIBMTP_new_file_t();
-    if (!meta) {
-        free(path_dup);
-        return -ENOMEM;
-    }
-    meta->filename = strdup(basename);
-    if (!meta->filename) {
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        return -ENOMEM;
-    }
-    meta->parent_id = parent_id;
-    meta->storage_id = storage_id;
-    meta->filesize = (uint64_t)size;
-    meta->filetype = guess_filetype_from_basename(basename);
-    meta->modificationdate = time(NULL);
+    int final_rc = -EIO;
 
-    int send_rc;
+    for (unsigned wave = 0; wave < (unsigned)MTP_SEND_OUTER_WAVES; wave++) {
+        if (wave > 0)
+            mtp_usb_backoff(10u + wave);
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            final_rc = -errno;
+            goto mtp_write_send_done;
+        }
 
-#ifdef __APPLE__
-    /* macOS workaround: libmtp Send_File_From_File_Descriptor on unlinked
-     * temp fd often fails mid-transfer ("device disappeared"). Use a named
-     * temp file with Send_File_From_File instead. Copy fd to temp snapshot,
-     * fsync, and send from that path. */
-
-    char snap_path[] = "/tmp/mtpfuse_upXXXXXX";
-    int snapfd = mkstemp(snap_path);
-    if (snapfd < 0) {
-        int e = errno;
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        return -e;
-    }
-
-    /* Copy staging fd to snapshot file. */
-    int copy_rc = copy_fd_to_fd_safe(fd, snapfd, size);
-    if (copy_rc != 0) {
-        close(snapfd);
-        unlink(snap_path);
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        mtp_debug_log("mtp_write_send_fd: copy_fd_to_fd_safe failed: %d", copy_rc);
-        return copy_rc;
-    }
-
-    struct stat snapst;
-    if (fstat(snapfd, &snapst) != 0) {
-        int e = errno;
-        close(snapfd);
-        unlink(snap_path);
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        mtp_debug_log("mtp_write_send_fd: fstat(snap) failed: %s", strerror(e));
-        return -e;
-    }
-    if ((uint64_t)snapst.st_size != (uint64_t)size) {
-        close(snapfd);
-        unlink(snap_path);
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        mtp_debug_log("mtp_write_send_fd: snapshot size mismatch (got %llu want %zu)",
-                      (unsigned long long)snapst.st_size, size);
-        return -EIO;
-    }
-
-    /* Flush snapshot to disk before sending. */
-    if (fsync(snapfd) < 0) {
-        int e = errno;
-        close(snapfd);
-        unlink(snap_path);
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        mtp_debug_log("mtp_write_send_fd: fsync(snapfd) failed: %s", strerror(e));
-        return -e;
-    }
-    close(snapfd);
-
-    if (hy_dest) {
-        int pr = adb_push_from_file(snap_path, hy_abs, 7200);
-        if (pr == 0) {
-            mtp_debug_log("mtp_write_send_fd: hybrid adb push ok %s", hy_abs);
-            unlink(snap_path);
+        LIBMTP_file_t *meta = LIBMTP_new_file_t();
+        if (!meta) {
+            final_rc = -ENOMEM;
+            goto mtp_write_send_done;
+        }
+        meta->filename = strdup(basename);
+        if (!meta->filename) {
             LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            pthread_mutex_lock(&g_lock);
-            mtp_node_t *pnow = resolve(parent_path);
-            if (pnow && pnow->children_loaded) {
-                mtp_node_t *ch = pnow->first_child;
-                pnow->first_child = NULL;
-                while (ch) {
-                    mtp_node_t *nx = ch->next_sibling;
-                    node_free(ch);
-                    ch = nx;
-                }
-                pnow->children_loaded = 0;
-                mtp_debug_log("mtp_write_send_fd: invalidated parent (hybrid write)");
+            final_rc = -ENOMEM;
+            goto mtp_write_send_done;
+        }
+        meta->parent_id = parent_id;
+        meta->storage_id = storage_id;
+        meta->filesize = (uint64_t)size;
+        meta->filetype = guess_filetype_from_basename(basename);
+        meta->modificationdate = time(NULL);
+
+        mtp_debug_log("mtp_write_send_fd: wave=%u sending via fd (size=%zu)", wave, size);
+        int send_rc = mtp_send_file_from_fd_retry(meta, fd);
+        mtp_debug_log("mtp_write_send_fd: wave=%u send_rc=%d", wave, send_rc);
+
+        if (send_rc == -ENODEV) {
+            LIBMTP_destroy_file_t(meta);
+            final_rc = -ENODEV;
+            goto mtp_write_send_done;
+        }
+        if (send_rc != 0) {
+            LIBMTP_destroy_file_t(meta);
+            continue;
+        }
+
+        int verify_ok = 1;
+        uint32_t new_oid = meta->item_id;
+        if (new_oid != 0u) {
+            pthread_mutex_lock(&g_mtp);
+            LIBMTP_file_t *chk = g_device ? LIBMTP_Get_Filemetadata(g_device, new_oid) : NULL;
+            pthread_mutex_unlock(&g_mtp);
+            if (!chk) {
+                mtp_debug_log("mtp_write_send_fd: post-send verify missing metadata oid=%u wave=%u",
+                              new_oid, wave);
+                mtp_delete_object_retry(new_oid);
+                verify_ok = 0;
+            } else if ((uint64_t)chk->filesize != (uint64_t)size) {
+                mtp_debug_log("mtp_write_send_fd: post-send SIZE oid=%u device=%llu sent=%zu wave=%u",
+                              new_oid, (unsigned long long)chk->filesize, size, wave);
+                LIBMTP_destroy_file_t(chk);
+                mtp_delete_object_retry(new_oid);
+                verify_ok = 0;
+            } else {
+                LIBMTP_destroy_file_t(chk);
             }
-            pthread_mutex_unlock(&g_lock);
-            return 0;
+        } else {
+            mtp_debug_log("mtp_write_send_fd: post-send verify skipped (item_id==0)");
         }
-        mtp_debug_log("mtp_write_send_fd: hybrid adb push failed rc=%d → MTP", pr);
-        if (replace_oid) {
-            int dr = mtp_delete_object_retry(replace_oid);
-            if (dr == -ENODEV) {
-                unlink(snap_path);
-                LIBMTP_destroy_file_t(meta);
-                free(path_dup);
-                return -ENODEV;
-            }
-            if (dr != 0) {
-                unlink(snap_path);
-                LIBMTP_destroy_file_t(meta);
-                free(path_dup);
-                return -EIO;
-            }
-            usleep(500000);
-        }
-    }
 
-    mtp_debug_log("mtp_write_send_fd: sending via named path %s (size=%zu)", snap_path, size);
-    send_rc = mtp_send_file_from_named_path_retry(meta, snap_path);
-    mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
-    unlink(snap_path);
+        if (verify_ok && new_oid != 0u && size > 0u && mtp_supports_partial_read()) {
+            if (mtp_verify_upload_head_tail_vs_fd(new_oid, fd, size) != 0) {
+                mtp_delete_object_retry(new_oid);
+                verify_ok = 0;
+            }
+        }
 
-#else  /* Linux */
-    if (hy_dest) {
-        char hy_snap[] = "/tmp/mtpfuse_hyXXXXXX";
-        int hyfd = mkstemp(hy_snap);
-        if (hyfd < 0) {
-            int e = errno;
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            return -e;
-        }
-        int cpr = copy_fd_to_fd_safe(fd, hyfd, size);
-        if (cpr != 0) {
-            close(hyfd);
-            unlink(hy_snap);
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            return cpr;
-        }
-        if (fsync(hyfd) < 0) {
-            int e = errno;
-            close(hyfd);
-            unlink(hy_snap);
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            return -e;
-        }
-        close(hyfd);
-        int pr = adb_push_from_file(hy_snap, hy_abs, 7200);
-        unlink(hy_snap);
-        if (pr == 0) {
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            pthread_mutex_lock(&g_lock);
-            mtp_node_t *pnow = resolve(parent_path);
-            if (pnow && pnow->children_loaded) {
-                mtp_node_t *ch = pnow->first_child;
-                pnow->first_child = NULL;
-                while (ch) {
-                    mtp_node_t *nx = ch->next_sibling;
-                    node_free(ch);
-                    ch = nx;
-                }
-                pnow->children_loaded = 0;
-            }
-            pthread_mutex_unlock(&g_lock);
-            return 0;
-        }
-        mtp_debug_log("mtp_write_send_fd: hybrid adb push failed rc=%d → MTP (linux)", pr);
-        if (replace_oid) {
-            int dr = mtp_delete_object_retry(replace_oid);
-            if (dr == -ENODEV) {
-                LIBMTP_destroy_file_t(meta);
-                free(path_dup);
-                return -ENODEV;
-            }
-            if (dr != 0) {
-                LIBMTP_destroy_file_t(meta);
-                free(path_dup);
-                return -EIO;
-            }
-            usleep(500000);
-        }
-    }
-    mtp_debug_log("mtp_write_send_fd: sending via fd (size=%zu)", size);
-    send_rc = mtp_send_file_from_fd_retry(meta, fd);
-    mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
-#endif
-
-    /* Check send result. */
-    if (send_rc == -ENODEV) {
         LIBMTP_destroy_file_t(meta);
+
+        if (!verify_ok)
+            continue;
+
+        pthread_mutex_lock(&g_lock);
+        mtp_node_t *parent_now = resolve(parent_path);
+        if (parent_now && parent_now->children_loaded) {
+            mtp_node_t *child = parent_now->first_child;
+            parent_now->first_child = NULL;
+            while (child) {
+                mtp_node_t *next = child->next_sibling;
+                node_free(child);
+                child = next;
+            }
+            parent_now->children_loaded = 0;
+            mtp_debug_log("mtp_write_send_fd: invalidated parent child cache");
+        }
+        pthread_mutex_unlock(&g_lock);
+
         free(path_dup);
-        return -ENODEV;
-    }
-    if (send_rc != 0) {
-        mtp_debug_log("mtp_write_send_fd: send failed with rc=%d", send_rc);
-        LIBMTP_destroy_file_t(meta);
-        free(path_dup);
-        return -EIO;
+        mtp_debug_log("mtp_write_send_fd: success");
+        return 0;
     }
 
-    /* libmtp fills item_id on success; confirm device-reported size (truncated USB
-     * uploads otherwise look like “bad MP4” on Mac + phone). */
-    if (meta->item_id != 0u) {
-        pthread_mutex_lock(&g_mtp);
-        LIBMTP_file_t *chk = g_device ? LIBMTP_Get_Filemetadata(g_device, meta->item_id) : NULL;
-        pthread_mutex_unlock(&g_mtp);
-        if (!chk) {
-            mtp_debug_log("mtp_write_send_fd: post-send verify missing metadata oid=%u",
-                          meta->item_id);
-            mtp_delete_object_retry(meta->item_id);
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            return -EIO;
-        }
-        if ((uint64_t)chk->filesize != (uint64_t)size) {
-            mtp_debug_log("mtp_write_send_fd: post-send SIZE oid=%u device=%llu sent=%zu (scrub)",
-                          meta->item_id, (unsigned long long)chk->filesize, size);
-            LIBMTP_destroy_file_t(chk);
-            mtp_delete_object_retry(meta->item_id);
-            LIBMTP_destroy_file_t(meta);
-            free(path_dup);
-            return -EIO;
-        }
-        LIBMTP_destroy_file_t(chk);
-    } else {
-        mtp_debug_log("mtp_write_send_fd: post-send verify skipped (item_id==0)");
-    }
-
-    /* Invalidate parent's child list to force refresh on next readdir. */
-    pthread_mutex_lock(&g_lock);
-    mtp_node_t *parent_now = resolve(parent_path);
-    if (parent_now && parent_now->children_loaded) {
-        mtp_node_t *child = parent_now->first_child;
-        parent_now->first_child = NULL;
-        while (child) {
-            mtp_node_t *next = child->next_sibling;
-            node_free(child);
-            child = next;
-        }
-        parent_now->children_loaded = 0;
-        mtp_debug_log("mtp_write_send_fd: invalidated parent child cache");
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    LIBMTP_destroy_file_t(meta);
+mtp_write_send_done:
     free(path_dup);
-    mtp_debug_log("mtp_write_send_fd: success");
-    return 0;
+    return final_rc;
 }
 
 int mtp_write_full_fd(const char *path, int fd, size_t size)
@@ -2158,9 +1815,19 @@ int mtp_rename(const char *from, const char *to)
     mtp_node_t *orphan_target = NULL;
 
     pthread_mutex_lock(&g_lock);
+    /* Cached directory listings go stale vs the phone; resolve() would not refetch
+     * with children_loaded set → ENOENT for a file Finder still shows → error -43. */
+    mtp_node_t *src_par = resolve(fparent_s);
+    if (src_par && src_par->is_dir)
+        dir_drop_children_locked(src_par);
+    mtp_node_t *dst_par0 = resolve(tparent_s);
+    if (dst_par0 && dst_par0->is_dir)
+        dir_drop_children_locked(dst_par0);
+
     mtp_node_t *src = resolve(from_use);
     if (!src) {
         pthread_mutex_unlock(&g_lock);
+        mtp_debug_log("mtp_rename: ENOENT from=%s (after parent cache drop)", from_use);
         free(fpath);
         free(tpath);
         return -ENOENT;
@@ -2214,17 +1881,10 @@ int mtp_rename(const char *from, const char *to)
 
     mtp_node_t *src_parent = src->parent;
     uint32_t new_parent_id = mtp_parent_handle(dst_parent);
-    uint32_t new_storage_id = dst_parent->storage_id;
+    uint32_t new_storage_id = node_effective_storage_id(dst_parent);
+    uint32_t dst_oid_for_meta = dst_parent->object_id;
     uint32_t src_oid = src->object_id;
-    uint32_t src_sid = src->storage_id;
-    if (src_sid == 0u) {
-        for (mtp_node_t *w = src->parent; w; w = w->parent) {
-            if (w->storage_id != 0u) {
-                src_sid = w->storage_id;
-                break;
-            }
-        }
-    }
+    uint32_t src_sid = node_effective_storage_id(src);
     int same_parent = (src_parent == dst_parent);
     int cross_dir_move = (!same_parent && src->is_dir);
 
@@ -2248,32 +1908,90 @@ int mtp_rename(const char *from, const char *to)
         }
     }
 
-    pthread_mutex_lock(&g_mtp);
-    if (!g_device) {
+    if (new_storage_id == 0u && dst_oid_for_meta != 0u) {
+        pthread_mutex_lock(&g_mtp);
+        if (g_device) {
+            LIBMTP_file_t *fm = LIBMTP_Get_Filemetadata(g_device, dst_oid_for_meta);
+            if (fm) {
+                if (fm->storage_id != 0u)
+                    new_storage_id = fm->storage_id;
+                LIBMTP_destroy_file_t(fm);
+            }
+        }
         pthread_mutex_unlock(&g_mtp);
-        free(fpath);
-        free(tpath);
-        mtp_refresh_tree();
-        return -ENODEV;
     }
-    int rc;
+    if (new_storage_id == 0u)
+        new_storage_id = src_sid;
+
+    int rc = -1;
     if (same_parent) {
-        rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
-    } else {
-        /* libmtp: Move_Object(device, object_id, storage_id, parent_id) — not
-         * (object_id, parent_id, storage_id). Wrong order produced EIO on mv. */
-        rc = LIBMTP_Move_Object(g_device, src_oid, new_storage_id, new_parent_id);
-        if (rc == 0)
+        for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+            if (k > 0)
+                mtp_usb_backoff((unsigned)k);
+            pthread_mutex_lock(&g_mtp);
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                free(fpath);
+                free(tpath);
+                mtp_refresh_tree();
+                return -ENODEV;
+            }
             rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
+            pthread_mutex_unlock(&g_mtp);
+            if (rc == 0)
+                break;
+            log_mtp_errors();
+        }
+    } else {
+        rc = -1;
+        for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES && rc != 0; k++) {
+            if (k > 0)
+                mtp_usb_backoff((unsigned)k);
+            pthread_mutex_lock(&g_mtp);
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                free(fpath);
+                free(tpath);
+                mtp_refresh_tree();
+                return -ENODEV;
+            }
+            rc = LIBMTP_Move_Object(g_device, src_oid, new_storage_id, new_parent_id);
+            pthread_mutex_unlock(&g_mtp);
+            if (rc != 0)
+                log_mtp_errors();
+        }
+        if (rc == 0) {
+            rc = -1;
+            for (unsigned j = 0; j < (unsigned)MTP_USB_RETRIES && rc != 0; j++) {
+                if (j > 0)
+                    mtp_usb_backoff((unsigned)j);
+                pthread_mutex_lock(&g_mtp);
+                if (!g_device) {
+                    pthread_mutex_unlock(&g_mtp);
+                    free(fpath);
+                    free(tpath);
+                    mtp_refresh_tree();
+                    return -ENODEV;
+                }
+                rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
+                pthread_mutex_unlock(&g_mtp);
+                if (rc != 0)
+                    log_mtp_errors();
+            }
+        }
     }
-    if (rc != 0) log_mtp_errors();
-    pthread_mutex_unlock(&g_mtp);
 
     if (rc != 0) {
         free(fpath);
         free(tpath);
-        /* Move failed - return EXDEV so Finder falls back to copy+delete */
-        return -EXDEV;
+        /* Do not return EXDEV: Finder would copy via FUSE and re-upload, which has
+         * corrupted media for some users. Prefer a hard error over a bad file. */
+        fprintf(stderr,
+            "mtpfuse: MTP move/rename failed (USB error). Try again, or move the file on the "
+            "phone. Avoid Finder copy fallback — it can damage large videos.\n");
+        mtp_debug_log("mtp_rename: failed same_parent=%d src_oid=%u dst_storage=%u dst_parent=0x%x",
+                      same_parent, src_oid, new_storage_id, new_parent_id);
+        return -EIO;
     }
 
     if (cross_dir_move) {
