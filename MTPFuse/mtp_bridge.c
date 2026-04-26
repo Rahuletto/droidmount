@@ -199,25 +199,56 @@ static int mtp_send_file_from_named_path_retry(LIBMTP_file_t *meta, const char *
     return -1;
 }
 
-/* Copy exactly nbytes from src (from current offset) to dst. */
-static int copy_fd_to_fd(int src, int dst, size_t nbytes)
+/* Robustly copy exactly nbytes from src to dst at current offsets.
+ * Returns 0 on success, -EIO on read/write error, -EINTR on signal. */
+static int copy_fd_to_fd_safe(int src, int dst, size_t nbytes)
 {
     unsigned char buf[256 * 1024];
-    size_t left = nbytes;
-    while (left > 0) {
-        size_t chunk = left < sizeof(buf) ? left : sizeof(buf);
-        ssize_t r = read(src, buf, chunk);
-        if (r <= 0)
-            return -1;
-        size_t written = 0;
-        while (written < (size_t)r) {
-            ssize_t w = write(dst, buf + written, (size_t)r - written);
-            if (w <= 0)
-                return -1;
-            written += (size_t)w;
+    size_t remaining = nbytes;
+    size_t total_copied = 0;
+    
+    while (remaining > 0) {
+        size_t to_read = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
+        ssize_t nread = read(src, buf, to_read);
+        
+        if (nread < 0) {
+            int e = errno;
+            mtp_debug_log("copy_fd_to_fd_safe: read error at offset %zu: %s",
+                         total_copied, strerror(e));
+            return -e;
         }
-        left -= (size_t)r;
+        if (nread == 0) {
+            /* Unexpected EOF before nbytes; this is corruption. */
+            mtp_debug_log("copy_fd_to_fd_safe: unexpected EOF at offset %zu (expected %zu total)",
+                         total_copied, nbytes);
+            return -EIO;
+        }
+        
+        /* Write all bytes read. */
+        size_t to_write = (size_t)nread;
+        size_t written = 0;
+        while (written < to_write) {
+            ssize_t nwrite = write(dst, buf + written, to_write - written);
+            if (nwrite < 0) {
+                int e = errno;
+                mtp_debug_log("copy_fd_to_fd_safe: write error at offset %zu: %s",
+                             total_copied + written, strerror(e));
+                return -e;
+            }
+            if (nwrite == 0) {
+                /* write() returned 0; unusual but treat as error. */
+                mtp_debug_log("copy_fd_to_fd_safe: write returned 0 at offset %zu",
+                             total_copied + written);
+                return -EIO;
+            }
+            written += (size_t)nwrite;
+        }
+        
+        remaining -= (size_t)nread;
+        total_copied += (size_t)nread;
     }
+    
+    mtp_debug_log("copy_fd_to_fd_safe: copied %zu bytes successfully", total_copied);
     return 0;
 }
 #endif
@@ -1131,132 +1162,182 @@ static void tree_detach(mtp_node_t *n)
     }
 }
 
-/* Send file bytes from fd (offset 0, length size) to MTP at path. */
+/* Send file bytes from fd (at current offset 0, length size) to MTP at path.
+ * Returns 0 on success, -errno on error. On macOS, creates a temporary snapshot
+ * file to work around libmtp fd-based send limitations. Automatically deletes
+ * existing files before creating new ones to ensure clean overwrites. */
 static int mtp_write_send_fd(const char *path, int fd, size_t size)
 {
-    char *dup = strdup(path);
-    if (!dup) return -ENOMEM;
-    char *slash = strrchr(dup, '/');
-    if (!slash) { free(dup); return -EINVAL; }
+    char *path_dup = strdup(path);
+    if (!path_dup)
+        return -ENOMEM;
+
+    /* Split path into parent and basename. */
+    char *slash = strrchr(path_dup, '/');
+    if (!slash) {
+        free(path_dup);
+        return -EINVAL;
+    }
     *slash = '\0';
-    const char *parent = (dup[0] == '\0') ? "/" : dup;
-    const char *name   = slash + 1;
-    if (!*name) { free(dup); return -EINVAL; }
+    const char *parent_path = (path_dup[0] == '\0') ? "/" : path_dup;
+    const char *basename = slash + 1;
+    if (!*basename) {
+        free(path_dup);
+        return -EINVAL;
+    }
 
+    mtp_debug_log("mtp_write_send_fd: path=%s size=%zu basename='%s'", path, size, basename);
+
+    /* Resolve parent directory and check validity. */
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *p = resolve(parent);
-    if (!p || !p->is_dir) {
-        pthread_mutex_unlock(&g_lock); free(dup); return -ENOENT;
+    mtp_node_t *parent_node = resolve(parent_path);
+    if (!parent_node || !parent_node->is_dir || parent_node == g_root || parent_node->is_synth) {
+        pthread_mutex_unlock(&g_lock);
+        free(path_dup);
+        int ec = (!parent_node || !parent_node->is_dir) ? ENOENT :
+                 (parent_node == g_root) ? EXDEV : EXDEV;
+        return -ec;
     }
-    if (p == g_root) {
-        pthread_mutex_unlock(&g_lock); free(dup); return -EXDEV;
-    }
-    if (p->is_synth) {
-        /* Not on device; EXDEV nudges Finder away from "permission" dialogs. */
-        pthread_mutex_unlock(&g_lock); free(dup); return -EXDEV;
-    }
-    uint32_t storage_id = p->storage_id;
-    uint32_t parent_id  = mtp_parent_handle(p);
 
+    uint32_t storage_id = parent_node->storage_id;
+    uint32_t parent_id = mtp_parent_handle(parent_node);
+
+    /* Check for existing file to replace. */
     uint32_t replace_oid = 0;
-    mtp_node_t *existing = node_find_child(p, name);
-    if (existing && !existing->is_dir)
+    mtp_node_t *existing = node_find_child(parent_node, basename);
+    if (existing && !existing->is_dir) {
         replace_oid = existing->object_id;
+        mtp_debug_log("mtp_write_send_fd: replacing existing file object_id=%u", replace_oid);
+    }
+
     pthread_mutex_unlock(&g_lock);
 
+    /* Delete existing file if necessary. */
     if (replace_oid) {
         int dr = mtp_delete_object_retry(replace_oid);
         if (dr == -ENODEV) {
-            free(dup);
+            free(path_dup);
             return -ENODEV;
         }
         if (dr != 0) {
-            free(dup);
+            mtp_debug_log("mtp_write_send_fd: failed to delete existing object_id=%u", replace_oid);
+            free(path_dup);
             return -EIO;
         }
+        /* Device stacks need time to process deletion. */
+        usleep(500000);
     }
 
+    /* Ensure fd is at offset 0 with pending writes flushed. */
     if (lseek(fd, 0, SEEK_SET) < 0) {
-        free(dup);
+        free(path_dup);
         return -errno;
     }
-
     if (fsync(fd) < 0) {
-        free(dup);
+        free(path_dup);
         return -errno;
     }
 
+    /* Create libmtp file metadata. */
     LIBMTP_file_t *meta = LIBMTP_new_file_t();
-    meta->filename   = strdup(name);
-    meta->parent_id  = parent_id;
+    if (!meta) {
+        free(path_dup);
+        return -ENOMEM;
+    }
+    meta->filename = strdup(basename);
+    if (!meta->filename) {
+        LIBMTP_destroy_file_t(meta);
+        free(path_dup);
+        return -ENOMEM;
+    }
+    meta->parent_id = parent_id;
     meta->storage_id = storage_id;
-    meta->filesize   = size;
-    meta->filetype   = LIBMTP_FILETYPE_UNKNOWN;
+    meta->filesize = (uint64_t)size;
+    meta->filetype = LIBMTP_FILETYPE_UNKNOWN;
     meta->modificationdate = time(NULL);
 
 #ifdef __APPLE__
-    /* macOS: Send_File_From_File_Descriptor on an unlinked mkstemp fd often
-     * fails on upload (Finder: “device disappeared”) while downloads work.
-     * libmtp path-based send is reliable here. */
-    if (replace_oid)
-        usleep(150000);
+    /* macOS workaround: libmtp Send_File_From_File_Descriptor on unlinked
+     * temp fd often fails mid-transfer ("device disappeared"). Use a named
+     * temp file with Send_File_From_File instead. Copy fd to temp snapshot,
+     * fsync, and send from that path. */
 
-    char snap_tpl[] = "/tmp/mtpfuse_upXXXXXX";
-    int snapfd = mkstemp(snap_tpl);
+    char snap_path[] = "/tmp/mtpfuse_upXXXXXX";
+    int snapfd = mkstemp(snap_path);
     if (snapfd < 0) {
+        int e = errno;
         LIBMTP_destroy_file_t(meta);
-        free(dup);
-        return -errno;
+        free(path_dup);
+        return -e;
     }
-    if (copy_fd_to_fd(fd, snapfd, size) != 0) {
+
+    /* Copy staging fd to snapshot file. */
+    int copy_rc = copy_fd_to_fd_safe(fd, snapfd, size);
+    if (copy_rc != 0) {
         close(snapfd);
-        unlink(snap_tpl);
+        unlink(snap_path);
         LIBMTP_destroy_file_t(meta);
-        free(dup);
-        return -EIO;
+        free(path_dup);
+        mtp_debug_log("mtp_write_send_fd: copy_fd_to_fd_safe failed: %d", copy_rc);
+        return copy_rc;
     }
+
+    /* Flush snapshot to disk before sending. */
     if (fsync(snapfd) < 0) {
         int e = errno;
         close(snapfd);
-        unlink(snap_tpl);
+        unlink(snap_path);
         LIBMTP_destroy_file_t(meta);
-        free(dup);
+        free(path_dup);
+        mtp_debug_log("mtp_write_send_fd: fsync(snapfd) failed: %s", strerror(e));
         return -e;
     }
     close(snapfd);
 
-    mtp_debug_log("mtp_write_send_fd: sending file path=%s size=%zu to parent_id=%u storage_id=%u",
-                  path, size, parent_id, storage_id);
-    int rc = mtp_send_file_from_named_path_retry(meta, snap_tpl);
-    mtp_debug_log("mtp_write_send_fd: send returned rc=%d", rc);
-    unlink(snap_tpl);
-#else
-    int rc = mtp_send_file_from_fd_retry(meta, fd);
+    mtp_debug_log("mtp_write_send_fd: sending via named path %s (size=%zu)", snap_path, size);
+    int send_rc = mtp_send_file_from_named_path_retry(meta, snap_path);
+    mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
+    unlink(snap_path);
+
+#else  /* Linux */
+    mtp_debug_log("mtp_write_send_fd: sending via fd (size=%zu)", size);
+    int send_rc = mtp_send_file_from_fd_retry(meta, fd);
+    mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
 #endif
-    if (rc == -ENODEV) {
+
+    /* Check send result. */
+    if (send_rc == -ENODEV) {
         LIBMTP_destroy_file_t(meta);
-        free(dup);
+        free(path_dup);
         return -ENODEV;
     }
-    if (rc != 0) {
+    if (send_rc != 0) {
+        mtp_debug_log("mtp_write_send_fd: send failed with rc=%d", send_rc);
         LIBMTP_destroy_file_t(meta);
-        free(dup);
+        free(path_dup);
         return -EIO;
     }
-    rc = 0;
 
+    /* Invalidate parent's child list to force refresh on next readdir. */
     pthread_mutex_lock(&g_lock);
-    p = resolve(parent);
-    if (p && rc == 0 && p->children_loaded) {
-        mtp_node_t *c = p->first_child; p->first_child = NULL;
-        while (c) { mtp_node_t *nx = c->next_sibling; node_free(c); c = nx; }
-        p->children_loaded = 0;
+    mtp_node_t *parent_now = resolve(parent_path);
+    if (parent_now && parent_now->children_loaded) {
+        mtp_node_t *child = parent_now->first_child;
+        parent_now->first_child = NULL;
+        while (child) {
+            mtp_node_t *next = child->next_sibling;
+            node_free(child);
+            child = next;
+        }
+        parent_now->children_loaded = 0;
+        mtp_debug_log("mtp_write_send_fd: invalidated parent child cache");
     }
     pthread_mutex_unlock(&g_lock);
 
     LIBMTP_destroy_file_t(meta);
-    free(dup);
-    return (rc == 0) ? 0 : -EIO;
+    free(path_dup);
+    mtp_debug_log("mtp_write_send_fd: success");
+    return 0;
 }
 
 int mtp_write_full_fd(const char *path, int fd, size_t size)
@@ -1423,10 +1504,8 @@ int mtp_rename(const char *from, const char *to)
     if (rc != 0) {
         free(fpath);
         free(tpath);
-        /* Cross-storage rename often fails on-device; EXDEV makes Finder copy+delete. */
-        if (!same_parent && new_storage_id != src_sid)
-            return -EXDEV;
-        return -EIO;
+        /* Move failed - return EXDEV so Finder falls back to copy+delete */
+        return -EXDEV;
     }
 
     if (cross_dir_move) {

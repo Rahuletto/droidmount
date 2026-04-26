@@ -313,7 +313,9 @@ static void xa_purge_path(const char *path, int is_dir)
     pthread_mutex_unlock(&g_xa_mu);
 }
 
-static int xa_get(const char *path, const char *name, char *value, size_t size)
+/* Darwin xattrs may be read/written with a byte [position] (resource-fork style). */
+static int xa_get(const char *path, const char *name, char *value, size_t size,
+                  uint32_t position)
 {
     if (!name)
         return -EINVAL;
@@ -333,26 +335,29 @@ static int xa_get(const char *path, const char *name, char *value, size_t size)
         return -ENODATA;
 #endif
     }
+    size_t tail = 0;
+    if (found->vlen > (size_t)position)
+        tail = found->vlen - (size_t)position;
     if (size == 0) {
-        size_t L = found->vlen;
         pthread_mutex_unlock(&g_xa_mu);
-        return (int)L;
+        return (int)tail;
     }
-    if (size < found->vlen) {
+    if (size < tail) {
         pthread_mutex_unlock(&g_xa_mu);
         return -ERANGE;
     }
-    memcpy(value, found->val, found->vlen);
+    if (tail && value && found->val)
+        memcpy(value, found->val + (size_t)position, tail);
     pthread_mutex_unlock(&g_xa_mu);
-    return (int)found->vlen;
+    return (int)tail;
 }
 
 static int xa_set(const char *path, const char *name, const char *value,
-                  size_t size, int flags)
+                  size_t size, int flags, uint32_t position)
 {
     if (!path || !name || !*name)
         return -EINVAL;
-    if (size > (size_t)XA_MAX_VALUE)
+    if ((uint64_t)position + (uint64_t)size > (uint64_t)XA_MAX_VALUE)
         return -E2BIG;
 #if defined(__APPLE__)
     {
@@ -386,38 +391,60 @@ static int xa_set(const char *path, const char *name, const char *value,
 #endif
     }
 #endif
-    unsigned char *nv = NULL;
-    if (size > 0) {
-        nv = malloc(size);
-        if (!nv) {
-            pthread_mutex_unlock(&g_xa_mu);
-            return -ENOMEM;
-        }
-        memcpy(nv, value, size);
-    }
+    const size_t need = (size_t)position + size;
+
     if (found) {
-        free(found->val);
-        found->val = nv;
-        found->vlen = size;
+        size_t newlen = found->vlen > need ? found->vlen : need;
+        if (newlen > (size_t)XA_MAX_VALUE) {
+            pthread_mutex_unlock(&g_xa_mu);
+            return -E2BIG;
+        }
+        unsigned char *nb = found->val;
+        if (newlen == 0) {
+            free(found->val);
+            found->val = NULL;
+            found->vlen = 0;
+        } else {
+            nb = realloc(found->val, newlen);
+            if (!nb) {
+                pthread_mutex_unlock(&g_xa_mu);
+                return -ENOMEM;
+            }
+            if (newlen > found->vlen)
+                memset(nb + found->vlen, 0, newlen - found->vlen);
+            if (size && value)
+                memcpy(nb + (size_t)position, value, size);
+            found->val = nb;
+            found->vlen = newlen;
+        }
         pthread_mutex_unlock(&g_xa_mu);
         return 0;
     }
+
     while (xa_count_unlocked() >= (size_t)XA_MAX_NODES)
         xa_evict_tail_unlocked();
     xa_ent_t *ne = calloc(1, sizeof(*ne));
     if (!ne) {
-        free(nv);
         pthread_mutex_unlock(&g_xa_mu);
         return -ENOMEM;
     }
     ne->path = strdup(path);
     ne->name = strdup(name);
-    ne->val  = nv;
-    ne->vlen = size;
     if (!ne->path || !ne->name) {
         xa_free_ent(ne);
         pthread_mutex_unlock(&g_xa_mu);
         return -ENOMEM;
+    }
+    if (need > 0) {
+        ne->val = calloc(1, need);
+        if (!ne->val) {
+            xa_free_ent(ne);
+            pthread_mutex_unlock(&g_xa_mu);
+            return -ENOMEM;
+        }
+        if (size && value)
+            memcpy(ne->val + (size_t)position, value, size);
+        ne->vlen = need;
     }
     ne->next = g_xa;
     g_xa = ne;
@@ -791,8 +818,13 @@ static int op_release(const char *path, struct fuse_file_info *fi)
         if (end < 0)
             rc = -errno;
         else {
-            int wr = mtp_write_full_fd(h->path, h->fd, (size_t)end);
-            if (wr < 0) rc = wr;
+            /* Seek to beginning before uploading, as mtp_write_full_fd expects fd at offset 0 */
+            if (lseek(h->fd, 0, SEEK_SET) < 0)
+                rc = -errno;
+            else {
+                int wr = mtp_write_full_fd(h->path, h->fd, (size_t)end);
+                if (wr < 0) rc = wr;
+            }
         }
     }
     if (h->created)
@@ -1027,15 +1059,14 @@ static int op_statfs(const char *path, struct statvfs *st)
 static int op_getxattr(const char *path, const char *name, char *value, size_t size,
                        uint32_t position)
 {
-    (void)position;
-    return xa_get(path, name, value, size);
+    return xa_get(path, name, value, size, position);
 }
 #else
 static int op_getxattr(const char *path, const char *name, char *value, size_t size)
 {
     static unsigned long xattr_seq;
     mtp_debug_log("fuse getxattr #%lu path=%s name=%s", ++xattr_seq, path, name ? name : "?");
-    return xa_get(path, name, value, size);
+    return xa_get(path, name, value, size, 0u);
 }
 #endif
 
@@ -1048,14 +1079,13 @@ static int op_listxattr(const char *path, char *list, size_t size)
 static int op_setxattr(const char *path, const char *name, const char *value,
                        size_t size, int flags, uint32_t position)
 {
-    (void)position;
-    return xa_set(path, name, value, size, flags);
+    return xa_set(path, name, value, size, flags, position);
 }
 #else
 static int op_setxattr(const char *path, const char *name, const char *value,
                        size_t size, int flags)
 {
-    return xa_set(path, name, value, size, flags);
+    return xa_set(path, name, value, size, flags, 0u);
 }
 #endif
 
