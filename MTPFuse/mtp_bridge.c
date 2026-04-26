@@ -329,6 +329,10 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+#if defined(__APPLE__)
+static void mtp_synth_attach_volume_meta(mtp_node_t *vol);
+#endif
+
 /* Caller must hold g_lock for the whole call; do not drop it here.
  * (Dropping g_lock during MTP raced with readdir snapshots → corrupt names.) */
 static void load_children(mtp_node_t *dir)
@@ -345,22 +349,45 @@ static void load_children(mtp_node_t *dir)
             dir->children_loaded = 1;
             return;
         }
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (attempt > 0) {
-                pthread_mutex_lock(&g_mtp);
-                if (g_device)
-                    LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
-                pthread_mutex_unlock(&g_mtp);
-            }
+        /* Some phones report NULL/duplicate StorageDescription for multiple
+         * volumes; skipping the second hid entire storages (e.g. only “SD card”). */
+        for (int attempt = 0; attempt < 3; attempt++) {
+            pthread_mutex_lock(&g_mtp);
+            if (g_device)
+                LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
+            pthread_mutex_unlock(&g_mtp);
+            if (!g_device)
+                break;
             for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
-                const char *nm = s->StorageDescription
-                                    ? s->StorageDescription : "Storage";
-                if (node_find_child(dir, nm)) continue;
-                mtp_node_t *n = node_new(nm, 1, 0, s->id);
-                if (n) node_add_child(dir, n);
+                const char *base = (s->StorageDescription && s->StorageDescription[0])
+                                       ? s->StorageDescription
+                                       : "Storage";
+                char vlabel[384];
+                snprintf(vlabel, sizeof(vlabel), "%.300s", base);
+                int tag = 0;
+                while (node_find_child(dir, vlabel)) {
+                    if (tag == 0)
+                        snprintf(vlabel, sizeof(vlabel), "%.280s [%u]", base, s->id);
+                    else
+                        snprintf(vlabel, sizeof(vlabel), "%.250s [%u]#%d", base, s->id, tag);
+                    tag++;
+                    if (tag > 64) {
+                        mtp_debug_log("[LOAD] root storage sid=%u: could not uniquify label", s->id);
+                        break;
+                    }
+                }
+                if (node_find_child(dir, vlabel))
+                    continue;
+                if (strcmp(vlabel, base) != 0)
+                    mtp_debug_log("[LOAD] root storage label sid=%u: \"%s\" → \"%s\"", s->id,
+                                  base, vlabel);
+                mtp_node_t *n = node_new(vlabel, 1, 0, s->id);
+                if (n)
+                    node_add_child(dir, n);
             }
             if (dir->first_child)
                 break;
+            mtp_usb_backoff((unsigned)(attempt + 1u));
         }
         dir->children_loaded = 1;
         mtp_debug_log("[LOAD] root done %.3fs", now_sec() - t0);
@@ -415,6 +442,10 @@ static void load_children(mtp_node_t *dir)
     }
 
     if (nkids == 0) {
+#if defined(__APPLE__)
+        if (dir->parent == g_root)
+            mtp_synth_attach_volume_meta(dir);
+#endif
         if (!dir->children_loaded)
             dir->children_loaded = 1;
         mtp_debug_log("[LOAD] \"%s\" empty folder (0 handles)", dbg);
@@ -470,6 +501,10 @@ static void load_children(mtp_node_t *dir)
 
     free(ids);
 
+#if defined(__APPLE__)
+    if (dir->parent == g_root)
+        mtp_synth_attach_volume_meta(dir);
+#endif
     if (!dir->children_loaded)
         dir->children_loaded = 1;
 
@@ -524,6 +559,26 @@ static void mtp_synth_free_user_branches(void)
             node_free(c);
             c = nx;
         }
+    }
+}
+
+/* Finder probes `/StorageName/.Trashes` on every volume; only `/.Trashes`
+ * was synthesised at the mount root, so ENOENT on storage volumes confused
+ * the metadata phase after a successful byte copy (“no permission”). */
+static void mtp_synth_attach_volume_meta(mtp_node_t *vol)
+{
+    static const char *names[] = { ".Trashes", ".fseventsd", ".TemporaryItems" };
+    if (!vol || !vol->is_dir || vol->parent != g_root)
+        return;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (node_find_child(vol, names[i]))
+            continue;
+        mtp_node_t *sn = node_new(names[i], 1, 0u, vol->storage_id);
+        if (!sn)
+            return;
+        sn->is_synth = 1;
+        sn->children_loaded = 1;
+        node_add_child(vol, sn);
     }
 }
 #endif
@@ -925,8 +980,8 @@ int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
     if (size == 0)
         return 0;
 
-    /* PTP max chunk is uint32; keep requests moderate for flaky USB. */
-    const uint32_t chunk_max = 256u * 1024u;
+    /* PTP max chunk is uint32; align with mount iosize=1MiB for fewer round-trips. */
+    const uint32_t chunk_max = 1048576u;
     uint32_t req = (size > (size_t)chunk_max) ? chunk_max : (uint32_t)size;
 
     for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
@@ -1356,7 +1411,9 @@ int mtp_rename(const char *from, const char *to)
     if (same_parent) {
         rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
     } else {
-        rc = LIBMTP_Move_Object(g_device, src_oid, new_parent_id, new_storage_id);
+        /* libmtp: Move_Object(device, object_id, storage_id, parent_id) — not
+         * (object_id, parent_id, storage_id). Wrong order produced EIO on mv. */
+        rc = LIBMTP_Move_Object(g_device, src_oid, new_storage_id, new_parent_id);
         if (rc == 0)
             rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
     }

@@ -31,6 +31,7 @@
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <sys/mount.h>
+#include <sys/xattr.h>
 #endif
 
 /* Skip eager prefetch on open for huge files (SD-card videos): Finder
@@ -205,6 +206,282 @@ static int pending_getattr(const char *path, struct stat *st)
     }
     pthread_mutex_unlock(&g_pending_mu);
     return 1;
+}
+
+/* Finder copies metadata with setxattr then reads it back with getxattr. We
+ * previously returned success from setxattr but ENOATTR from getxattr, which
+ * breaks the post-copy metadata phase (“no permission” after bytes copied). */
+typedef struct xa_ent {
+    struct xa_ent *next;
+    char          *path;
+    char          *name;
+    unsigned char *val;
+    size_t         vlen;
+} xa_ent_t;
+
+static xa_ent_t       *g_xa;
+static pthread_mutex_t g_xa_mu = PTHREAD_MUTEX_INITIALIZER;
+
+enum { XA_MAX_NODES = 450, XA_MAX_VALUE = 65536 };
+
+static void xa_free_ent(xa_ent_t *e)
+{
+    if (!e)
+        return;
+    free(e->path);
+    free(e->name);
+    free(e->val);
+    free(e);
+}
+
+static size_t xa_count_unlocked(void)
+{
+    size_t n = 0;
+    for (xa_ent_t *e = g_xa; e; e = e->next)
+        n++;
+    return n;
+}
+
+static void xa_evict_tail_unlocked(void)
+{
+    if (!g_xa)
+        return;
+    xa_ent_t **pp = &g_xa;
+    while ((*pp)->next)
+        pp = &(*pp)->next;
+    xa_ent_t *d = *pp;
+    *pp = NULL;
+    xa_free_ent(d);
+}
+
+static int path_has_prefix(const char *path, const char *prefix)
+{
+    size_t pl = strlen(prefix);
+    if (pl == 0)
+        return 0;
+    if (strncmp(path, prefix, pl) != 0)
+        return 0;
+    return path[pl] == '\0' || path[pl] == '/';
+}
+
+static void xa_rename_paths(const char *from, const char *to)
+{
+    size_t fl = strlen(from);
+    pthread_mutex_lock(&g_xa_mu);
+    for (xa_ent_t *e = g_xa; e; e = e->next) {
+        const char *p = e->path;
+        char       *np = NULL;
+        if (strcmp(p, from) == 0) {
+            np = strdup(to);
+        } else if (path_has_prefix(p, from)) {
+            size_t tlen = strlen(to);
+            size_t slen = strlen(p + fl);
+            np = malloc(tlen + slen + 1);
+            if (np) {
+                memcpy(np, to, tlen);
+                memcpy(np + tlen, p + fl, slen + 1);
+            }
+        }
+        if (np) {
+            free(e->path);
+            e->path = np;
+        }
+    }
+    pthread_mutex_unlock(&g_xa_mu);
+}
+
+static void xa_purge_path(const char *path, int is_dir)
+{
+    size_t L = strlen(path);
+    pthread_mutex_lock(&g_xa_mu);
+    xa_ent_t **pp = &g_xa;
+    while (*pp) {
+        int drop = 0;
+        if (strcmp((*pp)->path, path) == 0)
+            drop = 1;
+        else if (is_dir && L > 0 && strncmp((*pp)->path, path, L) == 0 &&
+                 (*pp)->path[L] == '/')
+            drop = 1;
+        if (drop) {
+            xa_ent_t *d = *pp;
+            *pp = d->next;
+            xa_free_ent(d);
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    pthread_mutex_unlock(&g_xa_mu);
+}
+
+static int xa_get(const char *path, const char *name, char *value, size_t size)
+{
+    if (!name)
+        return -EINVAL;
+    pthread_mutex_lock(&g_xa_mu);
+    xa_ent_t *found = NULL;
+    for (xa_ent_t *e = g_xa; e; e = e->next) {
+        if (strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+            found = e;
+            break;
+        }
+    }
+    if (!found) {
+        pthread_mutex_unlock(&g_xa_mu);
+#ifdef ENOATTR
+        return -ENOATTR;
+#else
+        return -ENODATA;
+#endif
+    }
+    if (size == 0) {
+        size_t L = found->vlen;
+        pthread_mutex_unlock(&g_xa_mu);
+        return (int)L;
+    }
+    if (size < found->vlen) {
+        pthread_mutex_unlock(&g_xa_mu);
+        return -ERANGE;
+    }
+    memcpy(value, found->val, found->vlen);
+    pthread_mutex_unlock(&g_xa_mu);
+    return (int)found->vlen;
+}
+
+static int xa_set(const char *path, const char *name, const char *value,
+                  size_t size, int flags)
+{
+    if (!path || !name || !*name)
+        return -EINVAL;
+    if (size > (size_t)XA_MAX_VALUE)
+        return -E2BIG;
+#if defined(__APPLE__)
+    {
+        int c = (flags & XATTR_CREATE) != 0;
+        int r = (flags & XATTR_REPLACE) != 0;
+        if (c && r)
+            return -EINVAL;
+    }
+#endif
+    pthread_mutex_lock(&g_xa_mu);
+    xa_ent_t **slot = &g_xa;
+    xa_ent_t  *found = NULL;
+    while (*slot) {
+        if (strcmp((*slot)->path, path) == 0 && strcmp((*slot)->name, name) == 0) {
+            found = *slot;
+            break;
+        }
+        slot = &(*slot)->next;
+    }
+#if defined(__APPLE__)
+    if ((flags & XATTR_CREATE) && found) {
+        pthread_mutex_unlock(&g_xa_mu);
+        return -EEXIST;
+    }
+    if ((flags & XATTR_REPLACE) && !found) {
+        pthread_mutex_unlock(&g_xa_mu);
+#ifdef ENOATTR
+        return -ENOATTR;
+#else
+        return -ENODATA;
+#endif
+    }
+#endif
+    unsigned char *nv = NULL;
+    if (size > 0) {
+        nv = malloc(size);
+        if (!nv) {
+            pthread_mutex_unlock(&g_xa_mu);
+            return -ENOMEM;
+        }
+        memcpy(nv, value, size);
+    }
+    if (found) {
+        free(found->val);
+        found->val = nv;
+        found->vlen = size;
+        pthread_mutex_unlock(&g_xa_mu);
+        return 0;
+    }
+    while (xa_count_unlocked() >= (size_t)XA_MAX_NODES)
+        xa_evict_tail_unlocked();
+    xa_ent_t *ne = calloc(1, sizeof(*ne));
+    if (!ne) {
+        free(nv);
+        pthread_mutex_unlock(&g_xa_mu);
+        return -ENOMEM;
+    }
+    ne->path = strdup(path);
+    ne->name = strdup(name);
+    ne->val  = nv;
+    ne->vlen = size;
+    if (!ne->path || !ne->name) {
+        xa_free_ent(ne);
+        pthread_mutex_unlock(&g_xa_mu);
+        return -ENOMEM;
+    }
+    ne->next = g_xa;
+    g_xa = ne;
+    pthread_mutex_unlock(&g_xa_mu);
+    return 0;
+}
+
+static int xa_list(const char *path, char *list, size_t size)
+{
+    pthread_mutex_lock(&g_xa_mu);
+    size_t need = 0;
+    for (xa_ent_t *e = g_xa; e; e = e->next) {
+        if (strcmp(e->path, path) != 0)
+            continue;
+        need += strlen(e->name) + 1;
+    }
+    if (size == 0) {
+        pthread_mutex_unlock(&g_xa_mu);
+        return (int)need;
+    }
+    if (size < need) {
+        pthread_mutex_unlock(&g_xa_mu);
+        return -ERANGE;
+    }
+    char *p = list;
+    for (xa_ent_t *e = g_xa; e; e = e->next) {
+        if (strcmp(e->path, path) != 0)
+            continue;
+        size_t nl = strlen(e->name) + 1;
+        memcpy(p, e->name, nl);
+        p += nl;
+    }
+    pthread_mutex_unlock(&g_xa_mu);
+    return (int)need;
+}
+
+static int xa_remove_one(const char *path, const char *name)
+{
+    pthread_mutex_lock(&g_xa_mu);
+    xa_ent_t **pp = &g_xa;
+    while (*pp) {
+        if (strcmp((*pp)->path, path) == 0 && strcmp((*pp)->name, name) == 0) {
+            xa_ent_t *d = *pp;
+            *pp = d->next;
+            xa_free_ent(d);
+            pthread_mutex_unlock(&g_xa_mu);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_xa_mu);
+#ifdef ENOATTR
+    return -ENOATTR;
+#else
+    return -ENODATA;
+#endif
+}
+
+static int mtp_rename_with_xattr(const char *from, const char *to)
+{
+    int rc = mtp_rename(from, to);
+    if (rc == 0)
+        xa_rename_paths(from, to);
+    return rc;
 }
 
 static int op_getattr(const char *path, struct stat *st)
@@ -530,12 +807,30 @@ static int op_release(const char *path, struct fuse_file_info *fi)
 
 static int op_rename(const char *from, const char *to)
 {
-    return mtp_rename(from, to);
+    return mtp_rename_with_xattr(from, to);
 }
 
-static int op_unlink(const char *path)        { return mtp_unlink(path); }
-static int op_mkdir (const char *path, mode_t m){ (void)m; return mtp_mkdir(path); }
-static int op_rmdir (const char *path)        { return mtp_rmdir(path); }
+static int op_unlink(const char *path)
+{
+    int rc = mtp_unlink(path);
+    if (rc == 0)
+        xa_purge_path(path, 0);
+    return rc;
+}
+
+static int op_mkdir(const char *path, mode_t m)
+{
+    (void)m;
+    return mtp_mkdir(path);
+}
+
+static int op_rmdir(const char *path)
+{
+    int rc = mtp_rmdir(path);
+    if (rc == 0)
+        xa_purge_path(path, 1);
+    return rc;
+}
 
 static int op_access(const char *path, int mask)
 {
@@ -617,7 +912,7 @@ static int op_renamex(const char *from, const char *to, unsigned int flags)
         if (mtp_stat(to, &sx) == 0)
             return -EEXIST;
     }
-    return mtp_rename(from, to);
+    return mtp_rename_with_xattr(from, to);
 }
 
 static int op_statfs_x(const char *path, struct statfs *st)
@@ -651,7 +946,9 @@ static int op_exchange(const char *p1, const char *p2, unsigned long opts)
     (void)p1;
     (void)p2;
     (void)opts;
-    return -ENOTSUP;
+    /* EXDEV steers Finder away from treating this like a local HFS exchange;
+     * -ENOTSUP was sometimes mapped to a generic “permission” alert after copy. */
+    return -EXDEV;
 }
 
 static int op_getxtimes(const char *path, struct timespec *bkuptime,
@@ -731,35 +1028,20 @@ static int op_getxattr(const char *path, const char *name, char *value, size_t s
                        uint32_t position)
 {
     (void)position;
-    (void)path;
-    (void)value;
-    if (!name)
-        return -EINVAL;
-    /* Empty value for any name: ENOATTR/ENODATA is often surfaced as "permission" in Finder. */
-    (void)size;
-    return 0;
+    return xa_get(path, name, value, size);
 }
 #else
 static int op_getxattr(const char *path, const char *name, char *value, size_t size)
 {
     static unsigned long xattr_seq;
     mtp_debug_log("fuse getxattr #%lu path=%s name=%s", ++xattr_seq, path, name ? name : "?");
-    (void)value;
-    (void)size;
-#ifdef ENOATTR
-    return -ENOATTR;
-#else
-    return -ENODATA;
-#endif
+    return xa_get(path, name, value, size);
 }
 #endif
 
 static int op_listxattr(const char *path, char *list, size_t size)
 {
-    (void)path;
-    (void)list;
-    (void)size;
-    return 0;
+    return xa_list(path, list, size);
 }
 
 #ifdef __APPLE__
@@ -767,25 +1049,19 @@ static int op_setxattr(const char *path, const char *name, const char *value,
                        size_t size, int flags, uint32_t position)
 {
     (void)position;
+    return xa_set(path, name, value, size, flags);
+}
 #else
 static int op_setxattr(const char *path, const char *name, const char *value,
                        size_t size, int flags)
 {
-#endif
-    /* Finder copies quarantine/FinderInfo/etc.; MTP has no xattrs — accept and drop. */
-    (void)path;
-    (void)name;
-    (void)value;
-    (void)size;
-    (void)flags;
-    return 0;
+    return xa_set(path, name, value, size, flags);
 }
+#endif
 
 static int op_removexattr(const char *path, const char *name)
 {
-    (void)path;
-    (void)name;
-    return 0;
+    return xa_remove_one(path, name);
 }
 
 static int op_fallocate(const char *path, int mode, off_t offset, off_t length,
@@ -799,7 +1075,20 @@ static int op_fallocate(const char *path, int mode, off_t offset, off_t length,
     return 0;
 }
 
+/* macFUSE fuse_conn_info has max_write / max_readahead (no max_read field). */
+static void *op_init(struct fuse_conn_info *conn)
+{
+#if defined(__APPLE__)
+    if (conn->max_write < (unsigned)1048576)
+        conn->max_write = (unsigned)1048576;
+    if (conn->max_readahead < (unsigned)2097152)
+        conn->max_readahead = (unsigned)2097152;
+#endif
+    return NULL;
+}
+
 struct fuse_operations mtpfuse_ops = {
+    .init        = op_init,
     .getattr     = op_getattr,
     .fgetattr    = op_fgetattr,
     .readdir     = op_readdir,

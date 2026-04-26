@@ -58,9 +58,19 @@ SWIFT_SRCS := \
     AndroidMount/USBWatcher.swift \
     AndroidMount/MountManager.swift
 
-.PHONY: all mtpfuse app run clean check-deps
+.PHONY: all mtpfuse app run clean check-deps check-mtpfuse check-e2e
 
 all: app mtpfuse bundle
+
+# Requires an MTP device + macFUSE; exercises mount, synth dirs, xattr, small copy.
+check-mtpfuse: $(BUILD)/mtpfuse
+	@./scripts/mtpfuse-selftest.sh
+
+# Launches AndroidMount.app, waits for ~/.AndroidMount FUSE, runs same ops as check-mtpfuse.
+# Needs GUI session + device. Optional: ANDROIDMOUNT_E2E_RESTART=1 ANDROIDMOUNT_E2E_QUIT=1 make check-e2e
+check-e2e: bundle
+	@chmod +x ./scripts/androidmount-e2e.sh
+	@./scripts/androidmount-e2e.sh
 
 # ---------- C FUSE helper ----------
 $(BUILD)/mtpfuse: $(C_SRCS) | $(BUILD)
