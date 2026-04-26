@@ -51,7 +51,8 @@ int main(int argc, char *argv[])
 
     /* Inject some sensible defaults if the caller didn't override them.
      * "local"     → Finder shows it as a local volume (sidebar entry)
-     * "noappledouble" / "noapplexattr" → no AppleDouble/._ files
+     * "noappledouble" → no AppleDouble/._ files (omit noapplexattr so Finder
+     * can read com.apple.FinderInfo on "/" for /.VolumeIcon.icns volume icons)
      * "iosize=1048576" → 1 MiB IO size so Finder copies don't crawl
      * The volname/volicon can be passed in by the launcher via -o. */
     char **fuse_argv = calloc((size_t)argc + 10, sizeof(char *));
@@ -69,7 +70,7 @@ int main(int argc, char *argv[])
     }
     if (!saw_o) {
         fuse_argv[n++] = (char *)"-o";
-        fuse_argv[n++] = (char *)"local,noappledouble,noapplexattr,"
+        fuse_argv[n++] = (char *)"local,noappledouble,"
                                  "iosize=1048576,volname=AndroidDevice";
     }
     fuse_argv[n] = NULL;

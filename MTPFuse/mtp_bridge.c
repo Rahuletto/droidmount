@@ -32,6 +32,7 @@
 #include <strings.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -282,7 +283,9 @@ static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
     /* Folders often have mtime==0 on MTP; Get_Filemetadata per folder during
      * readdir/stat was stalling listings and could leave Finder showing an
      * empty volume. Files still refresh when the listing left size/time unset. */
-    if (!n || n->object_id == 0 || n->mtime != 0 || n->is_dir)
+    if (!n || n->is_synth)
+        return;
+    if (n->object_id == 0 || n->mtime != 0 || n->is_dir)
         return;
     pthread_mutex_lock(&g_mtp);
     if (!g_device) {
@@ -362,6 +365,95 @@ static double now_sec(void)
 
 #if defined(__APPLE__)
 static void mtp_synth_attach_volume_meta(mtp_node_t *vol);
+
+/* Finder volume art: host .icns path from MTP_VOLUME_ICON_PATH; exposed as /.VolumeIcon.icns. */
+static char g_volicon_src[PATH_MAX];
+
+static void mtp_cache_volume_icon_path_from_env(void)
+{
+    g_volicon_src[0] = '\0';
+    const char *vip = getenv("MTP_VOLUME_ICON_PATH");
+    if (!vip || !vip[0])
+        return;
+    struct stat st;
+    if (stat(vip, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    if (snprintf(g_volicon_src, sizeof g_volicon_src, "%s", vip) >= (int)sizeof g_volicon_src)
+        g_volicon_src[0] = '\0';
+}
+
+static int mtp_volicon_pread(char *buf, size_t size, off_t offset)
+{
+    if (!g_volicon_src[0])
+        return -EIO;
+    int fd = open(g_volicon_src, O_RDONLY);
+    if (fd < 0)
+        return -errno;
+    ssize_t r = pread(fd, buf, size, offset);
+    int e = errno;
+    close(fd);
+    if (r < 0)
+        return -e;
+    return (int)r;
+}
+
+static int mtp_volicon_copy_to_fd(int outfd)
+{
+    if (!g_volicon_src[0])
+        return -EIO;
+    int in = open(g_volicon_src, O_RDONLY);
+    if (in < 0)
+        return -errno;
+    unsigned char chunk[64 * 1024];
+    ssize_t nread;
+    while ((nread = read(in, chunk, sizeof chunk)) > 0) {
+        ssize_t w = write(outfd, chunk, (size_t)nread);
+        if (w != nread) {
+            close(in);
+            return -EIO;
+        }
+    }
+    int saved = errno;
+    close(in);
+    if (nread < 0)
+        return -saved;
+    return 0;
+}
+
+static void mtp_add_root_volume_icon_locked(mtp_node_t *dir)
+{
+    if (dir != g_root)
+        return;
+    if (!g_volicon_src[0])
+        return;
+    if (node_find_child(dir, ".VolumeIcon.icns"))
+        return;
+    struct stat st;
+    if (stat(g_volicon_src, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    mtp_node_t *vn = node_new(".VolumeIcon.icns", 0, 0, 0);
+    if (!vn)
+        return;
+    vn->is_synth = 1;
+    vn->size = (uint64_t)st.st_size;
+    vn->mtime = st.st_mtime > 0 ? (uint64_t)st.st_mtime : (uint64_t)time(NULL);
+    node_add_child(dir, vn);
+}
+
+int mtp_root_volume_icon_active(void)
+{
+    if (!g_volicon_src[0])
+        return 0;
+    struct stat st;
+    return (stat(g_volicon_src, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+}
+#endif
+
+#if !defined(__APPLE__)
+int mtp_root_volume_icon_active(void)
+{
+    return 0;
+}
 #endif
 
 /* Caller must hold g_lock for the whole call; do not drop it here.
@@ -420,6 +512,9 @@ static void load_children(mtp_node_t *dir)
                 break;
             mtp_usb_backoff((unsigned)(attempt + 1u));
         }
+#if defined(__APPLE__)
+        mtp_add_root_volume_icon_locked(dir);
+#endif
         dir->children_loaded = 1;
         mtp_debug_log("[LOAD] root done %.3fs", now_sec() - t0);
         fprintf(stderr, "[LOAD] root done %.3fs\n", now_sec() - t0);
@@ -772,6 +867,9 @@ int mtp_open(void)
         return -1;
     }
     mtp_debug_log("mtp_open: success g_root=%p", (void *)g_root);
+#if defined(__APPLE__)
+    mtp_cache_volume_icon_path_from_env();
+#endif
     return 0;
 }
 
@@ -780,6 +878,7 @@ void mtp_close(void)
     mtp_debug_log("mtp_close: begin (release tree + device)");
     pthread_mutex_lock(&g_lock);
 #if defined(__APPLE__)
+    g_volicon_src[0] = '\0';
     mtp_synth_free_user_branches();
 #endif
     pthread_mutex_lock(&g_mtp);
@@ -885,6 +984,8 @@ int mtp_stat(const char *path, mtp_stat_t *out)
             if (n == &g_synth_trashes)     out->object_id = 0xE0000001u;
             else if (n == &g_synth_fsev)  out->object_id = 0xE0000002u;
             else if (n == &g_synth_temp)  out->object_id = 0xE0000003u;
+            else if (!n->is_dir && n->name && strcmp(n->name, ".VolumeIcon.icns") == 0)
+                out->object_id = 0xE0000004u;
             else {
                 /* User mkdir under synth (e.g. .Trashes/501) — must not use 0+0. */
                 uint32_t h = (uint32_t)(uintptr_t)(void *)n;
@@ -1053,6 +1154,17 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
     mtp_node_t *n = resolve(path);
     if (!n)        { pthread_mutex_unlock(&g_lock); return -ENOENT; }
     if (n->is_dir) { pthread_mutex_unlock(&g_lock); return -EISDIR; }
+#if defined(__APPLE__)
+    if (n->is_synth && !n->is_dir && n->name && strcmp(n->name, ".VolumeIcon.icns") == 0) {
+        uint64_t total = n->size;
+        pthread_mutex_unlock(&g_lock);
+        if ((uint64_t)offset >= total)
+            return 0;
+        if (offset + size > total)
+            size = (size_t)(total - (uint64_t)offset);
+        return mtp_volicon_pread(buf, size, offset);
+    }
+#endif
     uint32_t oid = n->object_id;
     uint64_t total = n->size;
     pthread_mutex_unlock(&g_lock);
@@ -1108,6 +1220,17 @@ int mtp_download_to_fd(const char *path, int fd)
         pthread_mutex_unlock(&g_lock);
         return -EISDIR;
     }
+#if defined(__APPLE__)
+    if (n->is_synth && !n->is_dir && n->name && strcmp(n->name, ".VolumeIcon.icns") == 0) {
+        pthread_mutex_unlock(&g_lock);
+        if (ftruncate(fd, 0) < 0)
+            return -errno;
+        if (lseek(fd, 0, SEEK_SET) < 0)
+            return -errno;
+        int cr = mtp_volicon_copy_to_fd(fd);
+        return (cr == 0) ? 0 : cr;
+    }
+#endif
     uint32_t oid = n->object_id;
     node_refresh_meta_if_stale_locked(n);
     uint64_t expect = n->size;

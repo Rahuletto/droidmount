@@ -101,6 +101,8 @@ bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse
 	else echo "  ! add $(ICNS_ICON) (or $(ICNS_LEGACY))"; exit 1; fi; \
 	if [ "$${NO_ASPECT_FILL_ICNS:-}" = "1" ]; then cp "$$SRC" "$$OUT_ICNS"; \
 	else "$(PACK_ICNS)" "$$SRC" "$$OUT_ICNS"; fi
+	@# Finder volume icon (macFUSE volicon=); optional — MountManager prefers this over system iPhone art
+	@if [ -f "icon/drive.icns" ]; then cp "icon/drive.icns" "$(APP)/Contents/Resources/drive.icns" && echo "  ICNS icon/drive.icns → drive.icns"; fi
 	@cp $(BUILD)/AndroidMount.bin "$(APP)/Contents/MacOS/AndroidMount"
 	@cp $(BUILD)/mtpfuse "$(APP)/Contents/MacOS/mtpfuse"
 	@chmod +x "$(APP)/Contents/MacOS/AndroidMount" \

@@ -481,6 +481,21 @@ static int xa_list(const char *path, char *list, size_t size)
     return (int)need;
 }
 
+static int xa_has_xattr(const char *path, const char *name)
+{
+    if (!path || !name)
+        return 0;
+    pthread_mutex_lock(&g_xa_mu);
+    for (xa_ent_t *e = g_xa; e; e = e->next) {
+        if (strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+            pthread_mutex_unlock(&g_xa_mu);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_xa_mu);
+    return 0;
+}
+
 static int xa_remove_one(const char *path, const char *name)
 {
     pthread_mutex_lock(&g_xa_mu);
@@ -1059,6 +1074,29 @@ static int op_statfs(const char *path, struct statvfs *st)
 static int op_getxattr(const char *path, const char *name, char *value, size_t size,
                        uint32_t position)
 {
+    /* FolderInfo (16) + ExtendedFolderInfo (16): kHasCustomIcon (0x0400) in finderFlags
+     * so Finder treats /.VolumeIcon.icns as this volume's artwork (needs xattrs in FUSE). */
+    if (path && path[0] == '/' && path[1] == '\0' && name &&
+        strcmp(name, "com.apple.FinderInfo") == 0 && mtp_root_volume_icon_active()) {
+        int xr = xa_get(path, name, value, size, position);
+        if (xr != -ENOATTR)
+            return xr;
+        static const unsigned char kRootFinderInfo[32] = {
+            0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x04, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        };
+        const size_t full = sizeof kRootFinderInfo;
+        if ((size_t)position >= full)
+            return 0;
+        size_t tail = full - (size_t)position;
+        if (size == 0)
+            return (int)tail;
+        if (size < tail)
+            return -ERANGE;
+        if (value)
+            memcpy(value, kRootFinderInfo + position, tail);
+        return (int)tail;
+    }
     return xa_get(path, name, value, size, position);
 }
 #else
@@ -1072,7 +1110,37 @@ static int op_getxattr(const char *path, const char *name, char *value, size_t s
 
 static int op_listxattr(const char *path, char *list, size_t size)
 {
-    return xa_list(path, list, size);
+#if defined(__APPLE__)
+    static const char kFi[] = "com.apple.FinderInfo";
+    const size_t fi_len = sizeof kFi; /* includes NUL */
+    int add_fi = (path && path[0] == '/' && path[1] == '\0' && mtp_root_volume_icon_active() &&
+                  !xa_has_xattr(path, kFi));
+#else
+    int add_fi = 0;
+    const size_t fi_len = 0;
+#endif
+    int need = xa_list(path, NULL, 0);
+    if (need < 0)
+        return need;
+#if defined(__APPLE__)
+    size_t total = (size_t)need + (add_fi ? fi_len : 0);
+#else
+    size_t total = (size_t)need;
+#endif
+    if (size == 0)
+        return (int)total;
+    if (size < total)
+        return -ERANGE;
+    if (need > 0) {
+        int w = xa_list(path, list, size);
+        if (w != need)
+            return w;
+    }
+#if defined(__APPLE__)
+    if (add_fi)
+        memcpy(list + (size_t)need, kFi, fi_len);
+#endif
+    return (int)total;
 }
 
 #ifdef __APPLE__

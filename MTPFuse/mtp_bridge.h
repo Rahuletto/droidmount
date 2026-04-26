@@ -86,6 +86,9 @@ int  mtp_rmdir(const char *path);
  * If `path` is `/` or cannot be resolved, sums all storages. Returns 0 or -errno. */
 int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t *free_bytes);
 
+/* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */
+int mtp_root_volume_icon_active(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -73,6 +74,7 @@ final class MountManager {
             let baseParts = parts.dropLast()
             let display = baseParts.isEmpty ? name : baseParts.joined(separator: "_")
             sessions[lid] = Session(mountPoint: path, process: nil)
+            Self.applyFinderVolumeIcon(at: path)
             out.append((locationID: lid, displayName: display))
         }
         return out
@@ -121,8 +123,10 @@ final class MountManager {
 
         let safeVol = Self.sanitizeVolumeLabel(device.name)
 
+        // Omit noapplexattr: Finder needs com.apple.FinderInfo on "/" to honor
+        // /.VolumeIcon.icns; with noapplexattr, macFUSE never forwards those xattrs.
         let fuseOpts =
-            "local,defer_permissions,noappledouble,noapplexattr,noatime," +
+            "local,defer_permissions,noappledouble,noatime," +
             "iosize=1048576,daemon_timeout=300," +
             "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
             ",volname=\(safeVol)"
@@ -142,6 +146,9 @@ final class MountManager {
             "/opt/homebrew/lib:/usr/local/lib:/Library/Frameworks/macFUSE.framework/Versions/A:" +
             (env["DYLD_FALLBACK_LIBRARY_PATH"] ?? "")
         env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
+        if let ic = Self.resolvedDriveIcnsPath() {
+            env["MTP_VOLUME_ICON_PATH"] = ic
+        }
         p.environment = env
 
         let errPipe = Pipe()
@@ -219,6 +226,7 @@ final class MountManager {
                         self.sessions[device.locationID] = Session(mountPoint: mountPoint, process: p)
                         self.sessionsLock.unlock()
                         Self.scheduleSpotlightExcluded(for: mountPoint)
+                        Self.applyFinderVolumeIcon(at: mountPoint)
                         returnOnce(.success(mountPoint))
                         return
                     }
@@ -435,12 +443,40 @@ final class MountManager {
         }
     }
 
+    /// `icon/drive.icns` copied to `Contents/Resources/drive.icns` by `make bundle`, or next to `build/` in dev.
+    private static func resolvedDriveIcnsPath() -> String? {
+        let fm = FileManager.default
+        if let p = Bundle.main.path(forResource: "drive", ofType: "icns"), fm.fileExists(atPath: p) {
+            return p
+        }
+        if let exe = Bundle.main.executableURL {
+            let candidate = (exe.deletingLastPathComponent().appendingPathComponent("../icon/drive.icns")).path
+            let std = (candidate as NSString).standardizingPath
+            if fm.fileExists(atPath: std) { return std }
+        }
+        return nil
+    }
+
     private static func resolvedVolumeIconPath() -> String? {
         if let c = cachedVolIconPath { return c }
         let fm = FileManager.default
-        let v = volumeIconCandidates.first { fm.fileExists(atPath: $0) }
+        var paths: [String] = []
+        if let p = resolvedDriveIcnsPath() {
+            paths.append(p)
+        }
+        paths.append(contentsOf: volumeIconCandidates.filter { fm.fileExists(atPath: $0) })
+        let v = paths.first
         cachedVolIconPath = v
         return v
+    }
+
+    /// Finder often ignores FUSE `volicon=`; set the mount folder icon from `drive.icns` when available.
+    private static func applyFinderVolumeIcon(at mountPoint: String) {
+        guard let iconPath = resolvedDriveIcnsPath(),
+              let image = NSImage(contentsOfFile: iconPath) else { return }
+        DispatchQueue.main.async {
+            NSWorkspace.shared.setIcon(image, forFile: mountPoint, options: [])
+        }
     }
 
     private func terminateMtpfuseProcesses(mountPoint: String) {
