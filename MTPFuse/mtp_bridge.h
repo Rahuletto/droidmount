@@ -27,7 +27,9 @@ int  mtp_refresh_tree(void);
 
 /* Path-oriented helpers used by the FUSE layer.
  * All paths are absolute and start with "/". The first component is the
- * storage name (e.g. "/Internal storage/DCIM/IMG_0001.jpg"). */
+ * storage name (e.g. "/Internal storage/DCIM/IMG_0001.jpg").
+ * After mtp_set_fuse_mount_point(), a full host path under that mount is
+ * accepted too (macOS may pass it for some VFS ops). */
 
 typedef struct {
     int      is_dir;

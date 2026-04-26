@@ -716,7 +716,7 @@ static int ensure_staging_from_partial(const char *path, handle_t *h)
         return 0;
     pthread_mutex_lock(&g_stage_mu);
     if (!h->cache_ready) {
-        int st = mtp_download_to_fd(path, h->fd);
+        int st = mtp_download_to_fd(h->path, h->fd);
         if (st != 0) {
             pthread_mutex_unlock(&g_stage_mu);
             return st;
@@ -752,7 +752,7 @@ static int op_open(const char *path, struct fuse_file_info *fi)
     /* Pull device payload once into staging fd (not for giants). */
     if (!h->use_partial && (fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
         s.size <= MTP_OP_OPEN_PREFETCH_MAX) {
-        int st = mtp_download_to_fd(path, h->fd);
+        int st = mtp_download_to_fd(h->path, h->fd);
         if (st != 0) {
             close(h->fd); free(h->path); free(h); return st;
         }
@@ -791,7 +791,8 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
     if (h->use_partial && !h->created) {
-        int pr = mtp_read_partial(h->object_id, h->remote_size, buf, size, offset);
+        /* mtp_read: hybrid ADB + MTP fallback (mtp_read_partial alone skips hybrid). */
+        int pr = mtp_read(h->path, buf, size, offset);
         return pr;
     }
     if (!h->cache_ready) {
@@ -801,7 +802,7 @@ static int op_read(const char *path, char *buf, size_t size, off_t offset,
         } else {
             pthread_mutex_lock(&g_stage_mu);
             if (!h->cache_ready) {
-                int st = mtp_download_to_fd(path, h->fd);
+                int st = mtp_download_to_fd(h->path, h->fd);
                 if (st != 0) {
                     pthread_mutex_unlock(&g_stage_mu);
                     return st;

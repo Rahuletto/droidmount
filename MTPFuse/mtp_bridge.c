@@ -26,6 +26,8 @@
 #define _DARWIN_C_SOURCE 1
 #include "mtp_bridge.h"
 
+#include "adb_subprocess.h"
+
 #include <libmtp.h>
 
 #include <errno.h>
@@ -52,6 +54,8 @@ typedef struct mtp_node {
     uint64_t         size;
     uint64_t         mtime;
     int              children_loaded;
+    /* MTP_HYBRID_ADB: Android path prefix for this storage volume (readdir still MTP). */
+    char             hybrid_adb_prefix[512];
     struct mtp_node *parent;
     struct mtp_node *first_child;
     struct mtp_node *next_sibling;
@@ -69,7 +73,19 @@ static pthread_mutex_t     g_mtp    = PTHREAD_MUTEX_INITIALIZER;
 /* -1 = unknown, 0 = no, 1 = yes (LIBMTP_DEVICECAP_GetPartialObject). */
 static int g_cap_partial_get = -1;
 
+/* MTP + ADB hybrid: MTP tree/listing; file bytes via adb when mapped (MTP_HYBRID_ADB=1). */
+static int  g_mtp_hybrid;
+static char g_mtp_hybrid_root[512];
+
 static void log_mtp_errors(void);
+
+static void mtp_hybrid_boot_from_env(void);
+static void mtp_hybrid_shutdown(void);
+static void mtp_hybrid_fill_volume_prefix(mtp_node_t *vol, LIBMTP_devicestorage_t *s, int nstor);
+static int mtp_hybrid_build_abs_for_file_locked(mtp_node_t *f, char *abs_out, size_t abs_cap);
+static int mtp_hybrid_build_abs_for_parent_basename_locked(mtp_node_t *parent_dir, const char *basename,
+                                                           char *abs_out, size_t abs_cap);
+static int mtp_hybrid_try_pread_abs(const char *abs_android, char *buf, size_t size, off_t offset);
 
 /* USB MTP stacks often flake with a single NAK; Finder maps hard I/O failure
  * to “The device disappeared.” Multi-level retries cover long full-file pulls. */
@@ -484,6 +500,246 @@ static void dir_drop_children_locked(mtp_node_t *dir)
     }
 }
 
+static void mtp_hybrid_boot_from_env(void)
+{
+    g_mtp_hybrid = 0;
+    g_mtp_hybrid_root[0] = '\0';
+    const char *hy = getenv("MTP_HYBRID_ADB");
+    if (!hy || !hy[0] || strcmp(hy, "0") == 0)
+        return;
+    adb_set_serial_from_env();
+    if (!adb_serial() || !adb_serial()[0])
+        return;
+    char out[512];
+    size_t len = 0;
+    const char *av[] = { "shell", "printenv", "EXTERNAL_STORAGE", NULL };
+    if (adb_run_capture(av, out, sizeof out, &len, 8) == 0 && len > 0) {
+        while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+            out[--len] = '\0';
+        if (len > 0 && out[0] == '/')
+            snprintf(g_mtp_hybrid_root, sizeof g_mtp_hybrid_root, "%s", out);
+    }
+    if (!g_mtp_hybrid_root[0])
+        snprintf(g_mtp_hybrid_root, sizeof g_mtp_hybrid_root, "%s", "/storage/emulated/0");
+    g_mtp_hybrid = 1;
+    fprintf(stderr, "mtp_hybrid: MTP folders + ADB file I/O (ANDROID path root=%s)\n", g_mtp_hybrid_root);
+    fflush(stderr);
+}
+
+static void mtp_hybrid_shutdown(void)
+{
+    g_mtp_hybrid = 0;
+    g_mtp_hybrid_root[0] = '\0';
+}
+
+static void mtp_hybrid_fill_volume_prefix(mtp_node_t *vol, LIBMTP_devicestorage_t *s, int nstor)
+{
+    if (!vol)
+        return;
+    vol->hybrid_adb_prefix[0] = '\0';
+    if (!g_mtp_hybrid || !s)
+        return;
+    const char *desc = s->StorageDescription;
+    int looks_sd = 0;
+    if (desc) {
+        if (strcasestr(desc, "SD"))
+            looks_sd = 1;
+        if (strcasestr(desc, "Card"))
+            looks_sd = 1;
+        if (strcasestr(desc, "Portable"))
+            looks_sd = 1;
+    }
+    if (nstor <= 1 || !looks_sd) {
+        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
+        return;
+    }
+    char list[4096];
+    size_t ln = 0;
+    const char *lsav[] = { "shell", "ls", "-1", "/storage", NULL };
+    if (adb_run_capture(lsav, list, sizeof list, &ln, 12) != 0 || ln == 0) {
+        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
+        return;
+    }
+    list[sizeof(list) - 1] = '\0';
+    char *save = NULL;
+    for (char *line = strtok_r(list, "\n\r", &save); line; line = strtok_r(NULL, "\n\r", &save)) {
+        if (!line[0])
+            continue;
+        if (strcmp(line, "emulated") == 0 || strcmp(line, "self") == 0)
+            continue;
+        snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "/storage/%s", line);
+        return;
+    }
+    snprintf(vol->hybrid_adb_prefix, sizeof vol->hybrid_adb_prefix, "%s", g_mtp_hybrid_root);
+}
+
+static int mtp_hybrid_build_abs_for_file_locked(mtp_node_t *f, char *abs_out, size_t abs_cap)
+{
+    if (!f || f->is_dir || !abs_out || abs_cap < 8)
+        return -1;
+    mtp_node_t *vol = f;
+    while (vol->parent && vol->parent != g_root)
+        vol = vol->parent;
+    if (!vol->parent || vol->parent != g_root || vol == g_root)
+        return -1;
+    if (!vol->hybrid_adb_prefix[0])
+        return -1;
+    mtp_node_t *stack[128];
+    int sp = 0;
+    for (mtp_node_t *x = f; x && x != vol; x = x->parent) {
+        if (sp >= 128)
+            return -1;
+        stack[sp++] = x;
+    }
+    if (vol == f) {
+        /* file cannot be volume node */
+        return -1;
+    }
+    char rel[4096];
+    rel[0] = '\0';
+    for (int i = sp - 1; i >= 0; i--) {
+        if (rel[0]) {
+            if (strlcat(rel, "/", sizeof rel) >= sizeof rel)
+                return -1;
+        }
+        if (strlcat(rel, stack[i]->name, sizeof rel) >= sizeof rel)
+            return -1;
+    }
+    if (rel[0]) {
+        if ((size_t)snprintf(abs_out, abs_cap, "%s/%s", vol->hybrid_adb_prefix, rel) >= abs_cap)
+            return -1;
+    } else {
+        if ((size_t)snprintf(abs_out, abs_cap, "%s", vol->hybrid_adb_prefix) >= abs_cap)
+            return -1;
+    }
+    return 0;
+}
+
+static int mtp_hybrid_build_abs_for_parent_basename_locked(mtp_node_t *parent_dir, const char *basename,
+                                                           char *abs_out, size_t abs_cap)
+{
+    if (!parent_dir || !basename || !basename[0] || !abs_out || abs_cap < 8)
+        return -1;
+    mtp_node_t *vol = parent_dir;
+    while (vol->parent && vol->parent != g_root)
+        vol = vol->parent;
+    if (!vol->parent || vol->parent != g_root || vol == g_root)
+        return -1;
+    if (!vol->hybrid_adb_prefix[0])
+        return -1;
+    mtp_node_t *stack[128];
+    int sp = 0;
+    for (mtp_node_t *x = parent_dir; x && x != vol; x = x->parent) {
+        if (sp >= 128)
+            return -1;
+        stack[sp++] = x;
+    }
+    char rel[4096];
+    rel[0] = '\0';
+    for (int i = sp - 1; i >= 0; i--) {
+        if (rel[0]) {
+            if (strlcat(rel, "/", sizeof rel) >= sizeof rel)
+                return -1;
+        }
+        if (strlcat(rel, stack[i]->name, sizeof rel) >= sizeof rel)
+            return -1;
+    }
+    if (rel[0]) {
+        if (snprintf(abs_out, abs_cap, "%s/%s/%s", vol->hybrid_adb_prefix, rel, basename) >= (int)abs_cap)
+            return -1;
+    } else {
+        if (snprintf(abs_out, abs_cap, "%s/%s", vol->hybrid_adb_prefix, basename) >= (int)abs_cap)
+            return -1;
+    }
+    return 0;
+}
+
+static int mtp_hybrid_shell_quote_path(const char *path, char *out, size_t cap)
+{
+    size_t o = 0;
+    if (o + 1 >= cap)
+        return -1;
+    out[o++] = '\'';
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p == '\'') {
+            if (o + 4 >= cap)
+                return -1;
+            memcpy(out + o, "'\\''", 4);
+            o += 4;
+        } else {
+            if (o + 1 >= cap)
+                return -1;
+            out[o++] = (char)*p;
+        }
+    }
+    if (o + 2 > cap)
+        return -1;
+    out[o++] = '\'';
+    out[o] = '\0';
+    return 0;
+}
+
+/* Prefer block-aligned `dd` for large reads (one adb exec-out vs tail|head per call).
+ * Unaligned offsets or small reads use `tail|head` (less read-ahead waste). */
+static int mtp_hybrid_try_pread_abs(const char *abs_android, char *buf, size_t size, off_t offset)
+{
+    if (!abs_android || !abs_android[0] || size == 0)
+        return -EIO;
+    if (offset < 0)
+        return -EINVAL;
+
+    const uint64_t BS = 1048576ULL; /* 1 MiB — matches typical FUSE iosize */
+    uint64_t off = (uint64_t)offset;
+
+    char esc[3072];
+    if (mtp_hybrid_shell_quote_path(abs_android, esc, sizeof esc) != 0)
+        return -EIO;
+
+    if (off % BS == 0 && size >= 65536u) {
+        uint64_t skip_blk = off / BS;
+        uint64_t nblks = ((uint64_t)size + BS - 1) / BS;
+        uint64_t out_bytes = nblks * BS;
+        /* Cap read-ahead so we do not malloc huge buffers on tiny tail waste edge cases. */
+        if (out_bytes <= 8u * 1024u * 1024u && nblks > 0) {
+            char script[6400];
+            int sn = snprintf(script, sizeof script,
+                              "dd if=%s bs=%llu skip=%llu count=%llu 2>/dev/null",
+                              esc, (unsigned long long)BS, (unsigned long long)skip_blk,
+                              (unsigned long long)nblks);
+            if (sn > 0 && sn < (int)sizeof script) {
+                unsigned char *tmp = (unsigned char *)malloc((size_t)out_bytes);
+                if (tmp) {
+                    int tmo = 60 + (int)((out_bytes / (1024u * 1024u)) * 30u);
+                    if (tmo > 480)
+                        tmo = 480;
+                    size_t got = 0;
+                    int rc = adb_exec_out_script_read(script, tmp, (size_t)out_bytes, tmo, &got);
+                    if (rc == 0 && got > 0) {
+                        size_t copy = got;
+                        if (copy > size)
+                            copy = size;
+                        memcpy(buf, tmp, copy);
+                        free(tmp);
+                        return (int)copy;
+                    }
+                    free(tmp);
+                }
+            }
+        }
+    }
+
+    unsigned long long start_byte = off + 1ULL;
+    char script[6400];
+    if (snprintf(script, sizeof script,
+                 "tail -c +%llu %s 2>/dev/null | head -c %zu 2>/dev/null",
+                 start_byte, esc, size) >= (int)sizeof script)
+        return -EIO;
+    size_t got = 0;
+    if (adb_exec_out_script_read(script, (unsigned char *)buf, size, 120, &got) != 0)
+        return -EIO;
+    return (int)got;
+}
+
 /* Caller must hold g_lock for the whole call; do not drop it here.
  * (Dropping g_lock during MTP raced with readdir snapshots → corrupt names.) */
 static void load_children(mtp_node_t *dir)
@@ -500,6 +756,9 @@ static void load_children(mtp_node_t *dir)
             dir->children_loaded = 1;
             return;
         }
+        int nstor = 0;
+        for (LIBMTP_devicestorage_t *sx = g_device->storage; sx; sx = sx->next)
+            nstor++;
         /* Some phones report NULL/duplicate StorageDescription for multiple
          * volumes; skipping the second hid entire storages (e.g. only “SD card”). */
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -533,8 +792,11 @@ static void load_children(mtp_node_t *dir)
                     mtp_debug_log("[LOAD] root storage label sid=%u: \"%s\" → \"%s\"", s->id,
                                   base, vlabel);
                 mtp_node_t *n = node_new(vlabel, 1, 0, s->id);
-                if (n)
+                if (n) {
+                    if (g_mtp_hybrid)
+                        mtp_hybrid_fill_volume_prefix(n, s, nstor);
                     node_add_child(dir, n);
+                }
             }
             if (dir->first_child)
                 break;
@@ -898,6 +1160,7 @@ int mtp_open(void)
 #if defined(__APPLE__)
     mtp_cache_volume_icon_path_from_env();
 #endif
+    mtp_hybrid_boot_from_env();
     return 0;
 }
 
@@ -945,9 +1208,18 @@ static const char *mtp_normalize_path_for_tree(const char *path, char *out, size
     return out;
 }
 
+/* macFUSE sometimes passes a full host path; map to in-mount "/Volume/…" for resolve(). */
+static const char *mtp_path_for_tree(const char *path, char *norm_buf, size_t norm_sz)
+{
+    if (!path || path[0] != '/')
+        return path;
+    return mtp_normalize_path_for_tree(path, norm_buf, norm_sz);
+}
+
 void mtp_close(void)
 {
     mtp_debug_log("mtp_close: begin (release tree + device)");
+    mtp_hybrid_shutdown();
     pthread_mutex_lock(&g_lock);
 #if defined(__APPLE__)
     g_volicon_src[0] = '\0';
@@ -1051,8 +1323,10 @@ int mtp_stat(const char *path, mtp_stat_t *out)
 {
     if (!out) return -EINVAL;
     double t0 = now_sec();
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     int rc = -ENOENT;
     if (n) {
         node_refresh_meta_if_stale_locked(n);
@@ -1106,8 +1380,11 @@ int mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out)
     double t_snap = now_sec();
     mtp_debug_log("readdir_snapshot ENTER path=%s", path);
 
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
+
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     if (!n) {
         pthread_mutex_unlock(&g_lock);
         mtp_debug_log("readdir_snapshot ENOENT path=%s (%.3fs)", path, now_sec() - t_snap);
@@ -1233,8 +1510,10 @@ int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
 int mtp_read(const char *path, char *buf, size_t size, off_t offset)
 {
     double t0 = now_sec();
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     if (!n)        { pthread_mutex_unlock(&g_lock); return -ENOENT; }
     if (n->is_dir) { pthread_mutex_unlock(&g_lock); return -EISDIR; }
 #if defined(__APPLE__)
@@ -1248,12 +1527,52 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
         return mtp_volicon_pread(buf, size, offset);
     }
 #endif
+    char hy_abs[4096];
+    int hy_ready = 0;
+    if (g_mtp_hybrid)
+        hy_ready = (mtp_hybrid_build_abs_for_file_locked(n, hy_abs, sizeof hy_abs) == 0);
     uint32_t oid = n->object_id;
     uint64_t total = n->size;
     pthread_mutex_unlock(&g_lock);
 
     if ((uint64_t)offset >= total) return 0;
     if (offset + size > total) size = (size_t)(total - offset);
+
+    if (hy_ready) {
+        int hr = -1;
+        for (int att = 0; att < 3; att++) {
+            if (att > 0)
+                usleep(45000);
+            hr = mtp_hybrid_try_pread_abs(hy_abs, buf, size, offset);
+            if (hr > 0) {
+                if ((size_t)hr == size) {
+                    mtp_debug_log("mtp_read hybrid path=%s ret=%d dt=%.3fs", path, hr, now_sec() - t0);
+                    return hr;
+                }
+                /* Short read: OK at EOF; otherwise ADB flake vs MTP tree — refill via MTP. */
+                if ((uint64_t)offset + (size_t)hr >= total) {
+                    mtp_debug_log("mtp_read hybrid path=%s ret=%d (EOF tail) dt=%.3fs", path, hr,
+                                  now_sec() - t0);
+                    return hr;
+                }
+                mtp_debug_log("mtp_read hybrid short mid-file path=%s got=%d want=%zu off=%llu → MTP",
+                              path, hr, size, (unsigned long long)offset);
+                break;
+            }
+            if (hr == 0) {
+                if ((uint64_t)offset >= total)
+                    return 0;
+                mtp_debug_log("mtp_read hybrid zero bytes path=%s off=%llu att=%d", path,
+                              (unsigned long long)offset, att);
+                continue;
+            }
+            if (att == 2)
+                mtp_debug_log("mtp_read hybrid adb miss path=%s rc=%d → MTP", path, hr);
+        }
+        if (hr == 0 && (uint64_t)offset < total)
+            mtp_debug_log("mtp_read hybrid zero after retries path=%s off=%llu → MTP", path,
+                          (unsigned long long)offset);
+    }
 
     mtp_debug_log("mtp_read begin path=%s oid=%u off=%lld sz=%zu file_sz=%llu",
                   path, oid, (long long)offset, size, (unsigned long long)total);
@@ -1303,8 +1622,10 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
 
 int mtp_download_to_fd(const char *path, int fd)
 {
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     if (!n) {
         pthread_mutex_unlock(&g_lock);
         return -ENOENT;
@@ -1324,6 +1645,10 @@ int mtp_download_to_fd(const char *path, int fd)
         return (cr == 0) ? 0 : cr;
     }
 #endif
+    char hy_abs[4096];
+    int hy_ready = 0;
+    if (g_mtp_hybrid)
+        hy_ready = (mtp_hybrid_build_abs_for_file_locked(n, hy_abs, sizeof hy_abs) == 0);
     uint32_t oid = n->object_id;
     node_refresh_meta_if_stale_locked(n);
     uint64_t expect = n->size;
@@ -1333,6 +1658,23 @@ int mtp_download_to_fd(const char *path, int fd)
         return -errno;
     if (lseek(fd, 0, SEEK_SET) < 0)
         return -errno;
+
+    if (hy_ready) {
+        int ar = adb_exec_out_cat_to_fd(hy_abs, fd, 7200);
+        if (ar == 0) {
+            struct stat st;
+            int fs = fstat(fd, &st);
+            if (fs == 0 && (uint64_t)st.st_size == expect)
+                return 0;
+            long long got_sz = (fs == 0) ? (long long)st.st_size : -1LL;
+            if (ftruncate(fd, 0) < 0)
+                return -errno;
+            if (lseek(fd, 0, SEEK_SET) < 0)
+                return -errno;
+            mtp_debug_log("mtp_download_to_fd hybrid size mismatch expect=%llu got=%lld → MTP",
+                          (unsigned long long)expect, got_sz);
+        }
+    }
 
     mtp_debug_log("mtp_download_to_fd path=%s oid=%u expect=%llu", path, oid,
                   (unsigned long long)expect);
@@ -1410,7 +1752,9 @@ static LIBMTP_filetype_t guess_filetype_from_basename(const char *base)
  * existing files before creating new ones to ensure clean overwrites. */
 static int mtp_write_send_fd(const char *path, int fd, size_t size)
 {
-    char *path_dup = strdup(path);
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
+    char *path_dup = strdup(path_use);
     if (!path_dup)
         return -ENOMEM;
 
@@ -1452,10 +1796,20 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
         mtp_debug_log("mtp_write_send_fd: replacing existing file object_id=%u", replace_oid);
     }
 
+    char hy_abs[4096];
+    int hy_dest = 0;
+    if (g_mtp_hybrid) {
+        if (replace_oid && existing && !existing->is_dir)
+            hy_dest = (mtp_hybrid_build_abs_for_file_locked(existing, hy_abs, sizeof hy_abs) == 0);
+        else if (!replace_oid)
+            hy_dest = (mtp_hybrid_build_abs_for_parent_basename_locked(parent_node, basename, hy_abs,
+                                                                      sizeof hy_abs) == 0);
+    }
+
     pthread_mutex_unlock(&g_lock);
 
-    /* Delete existing file if necessary. */
-    if (replace_oid) {
+    /* Delete existing MTP object unless hybrid will overwrite the same path via adb. */
+    if (replace_oid && !hy_dest) {
         int dr = mtp_delete_object_retry(replace_oid);
         if (dr == -ENODEV) {
             free(path_dup);
@@ -1511,6 +1865,8 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     meta->filesize = (uint64_t)size;
     meta->filetype = guess_filetype_from_basename(basename);
     meta->modificationdate = time(NULL);
+
+    int send_rc;
 
 #ifdef __APPLE__
     /* macOS workaround: libmtp Send_File_From_File_Descriptor on unlinked
@@ -1570,14 +1926,118 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     }
     close(snapfd);
 
+    if (hy_dest) {
+        int pr = adb_push_from_file(snap_path, hy_abs, 7200);
+        if (pr == 0) {
+            mtp_debug_log("mtp_write_send_fd: hybrid adb push ok %s", hy_abs);
+            unlink(snap_path);
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            pthread_mutex_lock(&g_lock);
+            mtp_node_t *pnow = resolve(parent_path);
+            if (pnow && pnow->children_loaded) {
+                mtp_node_t *ch = pnow->first_child;
+                pnow->first_child = NULL;
+                while (ch) {
+                    mtp_node_t *nx = ch->next_sibling;
+                    node_free(ch);
+                    ch = nx;
+                }
+                pnow->children_loaded = 0;
+                mtp_debug_log("mtp_write_send_fd: invalidated parent (hybrid write)");
+            }
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        mtp_debug_log("mtp_write_send_fd: hybrid adb push failed rc=%d → MTP", pr);
+        if (replace_oid) {
+            int dr = mtp_delete_object_retry(replace_oid);
+            if (dr == -ENODEV) {
+                unlink(snap_path);
+                LIBMTP_destroy_file_t(meta);
+                free(path_dup);
+                return -ENODEV;
+            }
+            if (dr != 0) {
+                unlink(snap_path);
+                LIBMTP_destroy_file_t(meta);
+                free(path_dup);
+                return -EIO;
+            }
+            usleep(500000);
+        }
+    }
+
     mtp_debug_log("mtp_write_send_fd: sending via named path %s (size=%zu)", snap_path, size);
-    int send_rc = mtp_send_file_from_named_path_retry(meta, snap_path);
+    send_rc = mtp_send_file_from_named_path_retry(meta, snap_path);
     mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
     unlink(snap_path);
 
 #else  /* Linux */
+    if (hy_dest) {
+        char hy_snap[] = "/tmp/mtpfuse_hyXXXXXX";
+        int hyfd = mkstemp(hy_snap);
+        if (hyfd < 0) {
+            int e = errno;
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            return -e;
+        }
+        int cpr = copy_fd_to_fd_safe(fd, hyfd, size);
+        if (cpr != 0) {
+            close(hyfd);
+            unlink(hy_snap);
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            return cpr;
+        }
+        if (fsync(hyfd) < 0) {
+            int e = errno;
+            close(hyfd);
+            unlink(hy_snap);
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            return -e;
+        }
+        close(hyfd);
+        int pr = adb_push_from_file(hy_snap, hy_abs, 7200);
+        unlink(hy_snap);
+        if (pr == 0) {
+            LIBMTP_destroy_file_t(meta);
+            free(path_dup);
+            pthread_mutex_lock(&g_lock);
+            mtp_node_t *pnow = resolve(parent_path);
+            if (pnow && pnow->children_loaded) {
+                mtp_node_t *ch = pnow->first_child;
+                pnow->first_child = NULL;
+                while (ch) {
+                    mtp_node_t *nx = ch->next_sibling;
+                    node_free(ch);
+                    ch = nx;
+                }
+                pnow->children_loaded = 0;
+            }
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        mtp_debug_log("mtp_write_send_fd: hybrid adb push failed rc=%d → MTP (linux)", pr);
+        if (replace_oid) {
+            int dr = mtp_delete_object_retry(replace_oid);
+            if (dr == -ENODEV) {
+                LIBMTP_destroy_file_t(meta);
+                free(path_dup);
+                return -ENODEV;
+            }
+            if (dr != 0) {
+                LIBMTP_destroy_file_t(meta);
+                free(path_dup);
+                return -EIO;
+            }
+            usleep(500000);
+        }
+    }
     mtp_debug_log("mtp_write_send_fd: sending via fd (size=%zu)", size);
-    int send_rc = mtp_send_file_from_fd_retry(meta, fd);
+    send_rc = mtp_send_file_from_fd_retry(meta, fd);
     mtp_debug_log("mtp_write_send_fd: send_rc=%d", send_rc);
 #endif
 
@@ -1674,8 +2134,12 @@ int mtp_rename(const char *from, const char *to)
     if (strcmp(from, to) == 0)
         return 0;
 
-    char *fpath = strdup(from);
-    char *tpath = strdup(to);
+    char nfrom[PATH_MAX], nto[PATH_MAX];
+    const char *from_use = mtp_path_for_tree(from, nfrom, sizeof nfrom);
+    const char *to_use = mtp_path_for_tree(to, nto, sizeof nto);
+
+    char *fpath = strdup(from_use);
+    char *tpath = strdup(to_use);
     if (!fpath || !tpath) {
         free(fpath);
         free(tpath);
@@ -1694,7 +2158,7 @@ int mtp_rename(const char *from, const char *to)
     mtp_node_t *orphan_target = NULL;
 
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *src = resolve(from);
+    mtp_node_t *src = resolve(from_use);
     if (!src) {
         pthread_mutex_unlock(&g_lock);
         free(fpath);
@@ -1730,7 +2194,7 @@ int mtp_rename(const char *from, const char *to)
         return -EXDEV;
     }
 
-    mtp_node_t *to_existing = resolve(to);
+    mtp_node_t *to_existing = resolve(to_use);
     if (to_existing) {
         if (to_existing->is_synth) {
             pthread_mutex_unlock(&g_lock);
@@ -1827,7 +2291,7 @@ int mtp_rename(const char *from, const char *to)
     }
 
     pthread_mutex_lock(&g_lock);
-    src = resolve(from);
+    src = resolve(from_use);
     mtp_node_t *dp = resolve(tparent_s);
     if (!src || !dp) {
         pthread_mutex_unlock(&g_lock);
@@ -1856,8 +2320,10 @@ int mtp_rename(const char *from, const char *to)
 
 int mtp_unlink(const char *path)
 {
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     if (!n)        { pthread_mutex_unlock(&g_lock); return -ENOENT; }
     if (n->is_dir) { pthread_mutex_unlock(&g_lock); return -EISDIR; }
     if (n->is_synth) {
@@ -1874,7 +2340,7 @@ int mtp_unlink(const char *path)
         return -EIO;
 
     pthread_mutex_lock(&g_lock);
-    n = resolve(path);
+    n = resolve(path_use);
     if (n && n->parent) {
         mtp_node_t **pp = &n->parent->first_child;
         while (*pp && *pp != n) pp = &(*pp)->next_sibling;
@@ -1886,7 +2352,9 @@ int mtp_unlink(const char *path)
 
 int mtp_mkdir(const char *path)
 {
-    char *dup = strdup(path);
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
+    char *dup = strdup(path_use);
     if (!dup) return -ENOMEM;
     char *slash = strrchr(dup, '/');
     if (!slash) { free(dup); return -EINVAL; }
@@ -1954,8 +2422,10 @@ int mtp_mkdir(const char *path)
 
 int mtp_rmdir(const char *path)
 {
+    char norm_buf[PATH_MAX];
+    const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path);
+    mtp_node_t *n = resolve(path_use);
     if (!n)         { pthread_mutex_unlock(&g_lock); return -ENOENT; }
     if (!n->is_dir) { pthread_mutex_unlock(&g_lock); return -ENOTDIR; }
     if (n == g_root) { pthread_mutex_unlock(&g_lock); return -EBUSY; }
@@ -1985,7 +2455,7 @@ int mtp_rmdir(const char *path)
         return -EIO;
 
     pthread_mutex_lock(&g_lock);
-    n = resolve(path);
+    n = resolve(path_use);
     if (n && n->parent) {
         mtp_node_t **pp = &n->parent->first_child;
         while (*pp && *pp != n) pp = &(*pp)->next_sibling;

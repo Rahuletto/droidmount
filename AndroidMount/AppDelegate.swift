@@ -186,7 +186,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 let isMounting = mountingDevices.contains(loc)
                 let pendingMtp = mtpModePending.contains(loc)
 
-                if let mp = path {
+                if isMounting {
+                    let pending = NSMenuItem(title: "Mounting…", action: nil, keyEquivalent: "")
+                    pending.isEnabled = false
+                    pending.image = Self.cachedSfMenuIconSpinner()
+                    sub.addItem(pending)
+                } else if let mp = path {
                     anyMounted = true
                     let open = NSMenuItem(title: "Show in Finder", action: #selector(openMount(_:)), keyEquivalent: "o")
                     open.target = self
@@ -196,11 +201,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     ej.target = self
                     ej.representedObject = NSNumber(value: loc)
                     sub.addItem(ej)
-                } else if isMounting {
-                    let pending = NSMenuItem(title: "Mounting…", action: nil, keyEquivalent: "")
-                    pending.isEnabled = false
-                    pending.image = Self.cachedSfMenuIconSpinner()
-                    sub.addItem(pending)
+                    let tr = mm.transport(for: loc)
+                    if tr == .mtpHybrid || tr == .adb {
+                        let adbLabel = NSMenuItem(title: "Using ADB", action: nil, keyEquivalent: "")
+                        adbLabel.isEnabled = false
+                        sub.addItem(adbLabel)
+                    } else {
+                        let req = NSMenuItem(
+                            title: "Request ADB mode",
+                            action: #selector(requestAdbOne(_:)),
+                            keyEquivalent: "")
+                        req.target = self
+                        req.representedObject = NSNumber(value: loc)
+                        sub.addItem(req)
+                    }
                 } else {
                     if pendingMtp {
                         let hint = NSMenuItem(
@@ -231,7 +245,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
 
-        menu.addItem(.separator())
         menu.addItem(withTitle: "Quit AndroidMount", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
         syncStatusItemVisibility(hasMountManager: true)
@@ -316,6 +329,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
               FileManager.default.fileExists(atPath: path) else { return }
         let url = URL(fileURLWithPath: path, isDirectory: true)
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func requestAdbOne(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        let loc = n.uint32Value
+        guard let dev = knownDevices[loc] else { return }
+        mountingDevices.insert(loc)
+        rebuildMenu()
+        mountManager?.requestAdbMode(device: dev) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.mountingDevices.remove(loc)
+                switch result {
+                case .success(let r):
+                    self.mtpModePending.remove(loc)
+                    self.mtpMenubarSlashGraceUntil.removeValue(forKey: loc)
+                    self.mtpPendingNotifySuppressedUntil.removeValue(forKey: loc)
+                    self.rebuildMenu()
+                    if let msg = r.mtpFallbackMessage {
+                        Self.presentInformativeAlert(title: "ADB mode", message: msg)
+                    }
+                case .failure(let err):
+                    self.mtpModePending.remove(loc)
+                    self.mtpMenubarSlashGraceUntil.removeValue(forKey: loc)
+                    self.mtpPendingNotifySuppressedUntil.removeValue(forKey: loc)
+                    self.rebuildMenu(error: err.localizedDescription, for: dev)
+                }
+            }
+        }
     }
 
     @objc private func ejectOne(_ sender: NSMenuItem) {
@@ -408,6 +450,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let img = PhoneSymbol.image(pointSize: 13, slashed: true) else { return phoneMenuIcon() }
         img.size = NSSize(width: 16, height: 16)
         return img
+    }
+
+    private static func presentInformativeAlert(title: String, message: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = message
+        a.alertStyle = .informational
+        a.runModal()
     }
 
     private static func presentMountFailureAlert(device: USBDevice, error: Error) {
