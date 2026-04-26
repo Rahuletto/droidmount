@@ -76,18 +76,28 @@ that built it. macOS may still prompt the first time you launch.
 * `mtp_bridge.c` – wraps libmtp: `LIBMTP_Init`, `Detect_Raw_Devices` /
   `Open_Raw_Device_Uncached`, `Get_Storage`, `Get_Files_And_Folders`
   **one folder level at a time** (lazy tree under `path → object_id`).
-* `fs_ops.c` – FUSE 2.x `getattr / readdir / read / write / unlink /
-  mkdir / rmdir / create / release / truncate`. Reads/writes are
+* `fs_ops.c` – FUSE 2.x `getattr / readdir / read / write / rename /
+  unlink / mkdir / rmdir / create / release / truncate`. Reads/writes are
   staged through a per-handle temp file because MTP is request/response
-  and not seekable; on `release()` a dirty handle is pushed back to the
-  device with `LIBMTP_Send_File_From_File_Descriptor`.
+  and not seekable; on `release()` a dirty handle is streamed back to the
+  device with `LIBMTP_Send_File_From_File_Descriptor` (no full-file
+  `malloc`).
 
 ## Limitations
 
-* Single device at a time (first raw device from libmtp detection).
-* Writes happen on `release()`, so very large copies stage to `/tmp`
-  first. Make sure you have enough free disk space.
-* No rename support yet (MTP rename is fiddly across vendors).
+* **Several phones at once:** the menu-bar app starts one `mtpfuse` per
+  USB `locationID` under `~/.AndroidMount/<name>_<locationHex>/`. Each
+  helper sets `MTP_USB_BUS_LOCATION` so libmtp opens the matching raw
+  device (`bus_location`). If a device is not found, set `MTP_RAW_INDEX`
+  or check stderr for the listed `bus_location` values.
+* Writes happen on `release()`, so very large copies still need enough
+  free disk space for the staging file under `/tmp`.
+* **Rename / move** uses `LIBMTP_Set_Object_Filename` and
+  `LIBMTP_Move_Object`; moving a folder to another parent refreshes the
+  in-memory tree. Some vendor MTP stacks may behave oddly.
+* There is no widely used “modern” replacement for **libmtp** on macOS
+  for Android file transfer; this project stays on libmtp for device
+  compatibility.
 * macFUSE is required; if the kext is missing the app pops a one-shot
   alert with a link to the installer instead of crashing.
 

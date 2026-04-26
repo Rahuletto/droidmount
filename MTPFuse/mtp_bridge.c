@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -180,6 +181,19 @@ static mtp_node_t *node_find_child(mtp_node_t *parent, const char *name)
     return NULL;
 }
 
+/* Volume nodes are synthetic: object_id 0 + real storage_id (see load_children).
+ * libmtp expects LIBMTP_FILES_AND_FOLDERS_ROOT for “this storage’s top level”,
+ * not parent handle 0 — using 0 breaks many phones (flat junk listings, wrong
+ * objects). g_root uses storage_id 0 so it is not confused with a volume. */
+static uint32_t mtp_parent_handle(const mtp_node_t *folder)
+{
+    if (!folder || folder == g_root)
+        return LIBMTP_FILES_AND_FOLDERS_ROOT;
+    if (folder->object_id == 0 && folder->storage_id != 0)
+        return LIBMTP_FILES_AND_FOLDERS_ROOT;
+    return folder->object_id;
+}
+
 static double now_sec(void)
 {
     struct timespec ts;
@@ -187,16 +201,8 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-static void free_file_list(LIBMTP_file_t *files)
-{
-    while (files) {
-        LIBMTP_file_t *nx = files->next;
-        LIBMTP_destroy_file_t(files);
-        files = nx;
-    }
-}
-
-/* Caller must hold g_lock. May unlock g_lock during MTP (long) I/O. */
+/* Caller must hold g_lock for the whole call; do not drop it here.
+ * (Dropping g_lock during MTP raced with readdir snapshots → corrupt names.) */
 static void load_children(mtp_node_t *dir)
 {
     if (!dir->is_dir || dir->children_loaded) return;
@@ -222,70 +228,84 @@ static void load_children(mtp_node_t *dir)
     }
 
     uint32_t sid = dir->storage_id;
-    uint32_t pid = dir->object_id;
+    uint32_t pid = mtp_parent_handle(dir);
     const char *dbg = dir->name ? dir->name : "?";
 
-    mtp_debug_log("[LOAD] \"%s\" sid=%u parent_id=%u → release g_lock, MTP Get_Files_And_Folders…",
+    mtp_debug_log("[LOAD] \"%s\" sid=%u parent_id=0x%x → Get_Children + per-object metadata",
                   dbg, sid, pid);
-    fprintf(stderr, "[LOAD] \"%s\" sid=%u parent_id=%u (MTP fetch, releasing tree lock)…\n",
+    fprintf(stderr, "[LOAD] \"%s\" sid=%u parent_id=0x%x (MTP listing)…\n",
             dbg, sid, pid);
     fflush(stderr);
 
-    pthread_mutex_unlock(&g_lock);
-
-    mtp_debug_log("[LOAD] \"%s\" waiting g_mtp (USB)…", dbg);
     pthread_mutex_lock(&g_mtp);
-    mtp_debug_log("[LOAD] \"%s\" g_mtp acquired, calling Get_Files_And_Folders", dbg);
-    LIBMTP_file_t *files = LIBMTP_Get_Files_And_Folders(g_device, sid, pid);
+    uint32_t *ids = NULL;
+    int nkids = LIBMTP_Get_Children(g_device, sid, pid, &ids);
     pthread_mutex_unlock(&g_mtp);
-    mtp_debug_log("[LOAD] \"%s\" Get_Files_And_Folders returned ptr=%p elapsed %.3fs",
-                  dbg, (void *)files, now_sec() - t0);
 
-    fprintf(stderr, "[LOAD] \"%s\" MTP done %.3fs\n", dbg, now_sec() - t0);
-    fflush(stderr);
+    mtp_debug_log("[LOAD] \"%s\" Get_Children → n=%d elapsed %.3fs",
+                  dbg, nkids, now_sec() - t0);
 
-    pthread_mutex_lock(&g_lock);
-
-    if (dir->children_loaded) {
-        mtp_debug_log("[LOAD] \"%s\" duplicate fetch discarded (already loaded)", dbg);
-        free_file_list(files);
-        return;
-    }
-
-    dir->children_loaded = 1;
-
-    if (!files) {
+    if (nkids < 0) {
         pthread_mutex_lock(&g_mtp);
         log_mtp_errors();
         pthread_mutex_unlock(&g_mtp);
-        mtp_debug_log("[LOAD] \"%s\" NULL list (empty folder or MTP error)", dbg);
-        fprintf(stderr, "[LOAD] \"%s\" empty or error (0 entries)\n", dbg);
+        if (!dir->children_loaded)
+            dir->children_loaded = 1;
+        fprintf(stderr, "[LOAD] \"%s\" Get_Children failed\n", dbg);
+        fflush(stderr);
+        return;
+    }
+
+    if (nkids == 0) {
+        if (!dir->children_loaded)
+            dir->children_loaded = 1;
+        mtp_debug_log("[LOAD] \"%s\" empty folder (0 handles)", dbg);
+        fprintf(stderr, "[LOAD] \"%s\" done: 0 entries\n", dbg);
         fflush(stderr);
         return;
     }
 
     int count = 0;
-    while (files) {
-        LIBMTP_file_t *nx = files->next;
-        int is_dir = (files->filetype == LIBMTP_FILETYPE_FOLDER);
-        if (files->filename && !node_find_child(dir, files->filename)) {
-            mtp_node_t *n = node_new(files->filename, is_dir,
-                                     files->item_id, files->storage_id);
-            if (n) {
-                n->size  = files->filesize;
-                n->mtime = files->modificationdate;
-                node_add_child(dir, n);
-                count++;
-                if ((count % 200) == 0) {
-                    mtp_debug_log("[LOAD] \"%s\" merge progress %d entries", dbg, count);
-                    fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
-                    fflush(stderr);
+    for (int i = 0; i < nkids; i++) {
+        pthread_mutex_lock(&g_mtp);
+        LIBMTP_file_t *file = LIBMTP_Get_Filemetadata(g_device, ids[i]);
+        pthread_mutex_unlock(&g_mtp);
+
+        if (dir->children_loaded) {
+            if (file)
+                LIBMTP_destroy_file_t(file);
+            free(ids);
+            mtp_debug_log("[LOAD] \"%s\" superseded after %d/%d metadata fetches",
+                          dbg, i, nkids);
+            return;
+        }
+        if (file) {
+            int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
+            if (file->filename && file->filename[0] &&
+                !node_find_child(dir, file->filename)) {
+                mtp_node_t *n = node_new(file->filename, is_dir,
+                                         file->item_id, file->storage_id);
+                if (n) {
+                    n->size  = file->filesize;
+                    n->mtime = file->modificationdate;
+                    node_add_child(dir, n);
+                    count++;
+                    if ((count % 200) == 0) {
+                        mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
+                                      dbg, count, now_sec() - t0);
+                        fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
+                        fflush(stderr);
+                    }
                 }
             }
+            LIBMTP_destroy_file_t(file);
         }
-        LIBMTP_destroy_file_t(files);
-        files = nx;
     }
+
+    free(ids);
+
+    if (!dir->children_loaded)
+        dir->children_loaded = 1;
 
     mtp_debug_log("[LOAD] \"%s\" done: %d entries in %.3fs", dbg, count, now_sec() - t0);
     fprintf(stderr, "[LOAD] \"%s\" done: %d entries in %.3fs\n",
@@ -294,7 +314,7 @@ static void load_children(mtp_node_t *dir)
 }
 
 /* Resolve "/a/b/c" → node, lazy-loading directories along the way.
- * Returns NULL if any component does not exist. */
+ * Call only while holding g_lock (load_children keeps the lock). */
 static mtp_node_t *resolve(const char *path)
 {
     if (!path || path[0] != '/') return NULL;
@@ -323,6 +343,54 @@ static void log_mtp_errors(void)
     LIBMTP_Clear_Errorstack(g_device);
 }
 
+/* Pick raw[] index: env MTP_USB_BUS_LOCATION (decimal or 0x hex) should match
+ * libmtp bus_location; else MTP_RAW_INDEX; else 0. */
+static int pick_raw_device_index(LIBMTP_raw_device_t *raw, int n_raw)
+{
+    const char *want_env = getenv("MTP_USB_BUS_LOCATION");
+    if (want_env && want_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(want_env, &end, 0);
+        if (end != want_env && *end == '\0' && v <= UINT32_MAX) {
+            uint32_t want = (uint32_t)v;
+            for (int i = 0; i < n_raw; i++) {
+                if (raw[i].bus_location == want) {
+                    mtp_debug_log("mtp_open: raw[%d] bus_location=0x%x matches "
+                                  "MTP_USB_BUS_LOCATION",
+                                  i, want);
+                    fprintf(stderr, "mtp_open: using raw[%d] bus_location=0x%x\n",
+                            i, want);
+                    fflush(stderr);
+                    return i;
+                }
+            }
+            mtp_debug_log("mtp_open: no raw[] with bus_location=0x%x (wanted "
+                          "MTP_USB_BUS_LOCATION=%s)",
+                          want, want_env);
+            fprintf(stderr, "mtp_open: no device with bus_location=0x%x; candidates:\n",
+                    want);
+            for (int i = 0; i < n_raw; i++) {
+                fprintf(stderr, "  [%d] bus_location=0x%x VID=%04x PID=%04x\n",
+                        i, raw[i].bus_location,
+                        raw[i].device_entry.vendor_id,
+                        raw[i].device_entry.product_id);
+            }
+            fflush(stderr);
+        }
+    }
+    const char *ix_env = getenv("MTP_RAW_INDEX");
+    if (ix_env && ix_env[0]) {
+        int j = atoi(ix_env);
+        if (j >= 0 && j < n_raw) {
+            mtp_debug_log("mtp_open: using MTP_RAW_INDEX=%d", j);
+            fprintf(stderr, "mtp_open: using MTP_RAW_INDEX=%d\n", j);
+            fflush(stderr);
+            return j;
+        }
+    }
+    return 0;
+}
+
 /* ---------- public api ---------- */
 
 int mtp_open(void)
@@ -348,12 +416,16 @@ int mtp_open(void)
         free(raw);
         return -1;
     }
-    mtp_debug_log("mtp_open: Open_Raw_Device_Uncached VID=%04x PID=%04x",
-                  raw[0].device_entry.vendor_id, raw[0].device_entry.product_id);
-    fprintf(stderr, "mtp_open: opening raw device 0 (VID=%04x PID=%04x)...\n",
-            raw[0].device_entry.vendor_id, raw[0].device_entry.product_id);
+    int ri = pick_raw_device_index(raw, n_raw);
+    mtp_debug_log("mtp_open: Open_Raw_Device_Uncached raw[%d] VID=%04x PID=%04x "
+                  "bus_location=0x%x",
+                  ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
+                  raw[ri].bus_location);
+    fprintf(stderr, "mtp_open: opening raw device %d (VID=%04x PID=%04x bus=0x%x)...\n",
+            ri, raw[ri].device_entry.vendor_id, raw[ri].device_entry.product_id,
+            raw[ri].bus_location);
     fflush(stderr);
-    g_device = LIBMTP_Open_Raw_Device_Uncached(&raw[0]);
+    g_device = LIBMTP_Open_Raw_Device_Uncached(&raw[ri]);
     free(raw);
     if (!g_device) {
         mtp_debug_log("mtp_open: Open_Raw_Device failed");
@@ -538,9 +610,75 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
     return err;
 }
 
-int mtp_write_full(const char *path, const char *buf, size_t size)
+int mtp_download_to_fd(const char *path, int fd)
 {
-    /* Split path into parent dir + basename */
+    pthread_mutex_lock(&g_lock);
+    mtp_node_t *n = resolve(path);
+    if (!n) {
+        pthread_mutex_unlock(&g_lock);
+        return -ENOENT;
+    }
+    if (n->is_dir) {
+        pthread_mutex_unlock(&g_lock);
+        return -EISDIR;
+    }
+    uint32_t oid = n->object_id;
+    pthread_mutex_unlock(&g_lock);
+
+    if (ftruncate(fd, 0) < 0)
+        return -errno;
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return -errno;
+
+    mtp_debug_log("mtp_download_to_fd path=%s oid=%u", path, oid);
+    pthread_mutex_lock(&g_mtp);
+    int rc = LIBMTP_Get_File_To_File_Descriptor(
+        g_device, oid, fd, NULL, NULL);
+    if (rc != 0)
+        log_mtp_errors();
+    pthread_mutex_unlock(&g_mtp);
+    return (rc == 0) ? 0 : -EIO;
+}
+
+/* path_copy is a writable copy of an absolute path; splits into parent + name. */
+static int path_parent_basename(char *path_copy, const char **parent, const char **name)
+{
+    if (!path_copy || path_copy[0] != '/')
+        return -EINVAL;
+    if (path_copy[1] == '\0')
+        return -EINVAL;
+    char *slash = strrchr(path_copy + 1, '/');
+    if (!slash) {
+        *parent = "/";
+        *name = path_copy + 1;
+    } else {
+        *slash = '\0';
+        *parent = path_copy;
+        *name = slash + 1;
+    }
+    if (!**name)
+        return -EINVAL;
+    return 0;
+}
+
+static void tree_detach(mtp_node_t *n)
+{
+    if (!n || !n->parent)
+        return;
+    mtp_node_t *p = n->parent;
+    mtp_node_t **slot = &p->first_child;
+    while (*slot && *slot != n)
+        slot = &(*slot)->next_sibling;
+    if (*slot) {
+        *slot = n->next_sibling;
+        n->next_sibling = NULL;
+        n->parent = NULL;
+    }
+}
+
+/* Send file bytes from fd (offset 0, length size) to MTP at path. */
+static int mtp_write_send_fd(const char *path, int fd, size_t size)
+{
     char *dup = strdup(path);
     if (!dup) return -ENOMEM;
     char *slash = strrchr(dup, '/');
@@ -555,10 +693,9 @@ int mtp_write_full(const char *path, const char *buf, size_t size)
     if (!p || !p->is_dir) {
         pthread_mutex_unlock(&g_lock); free(dup); return -ENOENT;
     }
-    /* Storage root container required */
     uint32_t storage_id = p->storage_id;
-    uint32_t parent_id  = (p == g_root) ? 0 : p->object_id;
-    if (p == g_root) { /* writing into the root listing is not allowed */
+    uint32_t parent_id  = mtp_parent_handle(p);
+    if (p == g_root) {
         pthread_mutex_unlock(&g_lock); free(dup); return -EACCES;
     }
 
@@ -574,25 +711,17 @@ int mtp_write_full(const char *path, const char *buf, size_t size)
         pthread_mutex_unlock(&g_mtp);
     }
 
-    /* Stage the bytes in a temp file (libmtp wants an fd). */
-    char tmpl[] = "/tmp/mtpfuse_wrXXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) { free(dup); return -errno; }
-    unlink(tmpl);
-    ssize_t off = 0;
-    while ((size_t)off < size) {
-        ssize_t w = write(fd, buf + off, size - off);
-        if (w <= 0) { close(fd); free(dup); return -EIO; }
-        off += w;
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        free(dup);
+        return -errno;
     }
-    lseek(fd, 0, SEEK_SET);
 
     LIBMTP_file_t *meta = LIBMTP_new_file_t();
-    meta->filename       = strdup(name);
-    meta->parent_id      = parent_id;
-    meta->storage_id     = storage_id;
-    meta->filesize       = size;
-    meta->filetype       = LIBMTP_FILETYPE_UNKNOWN;
+    meta->filename   = strdup(name);
+    meta->parent_id  = parent_id;
+    meta->storage_id = storage_id;
+    meta->filesize   = size;
+    meta->filetype   = LIBMTP_FILETYPE_UNKNOWN;
 
     pthread_mutex_lock(&g_mtp);
     int rc = LIBMTP_Send_File_From_File_Descriptor(
@@ -610,9 +739,176 @@ int mtp_write_full(const char *path, const char *buf, size_t size)
     pthread_mutex_unlock(&g_lock);
 
     LIBMTP_destroy_file_t(meta);
-    close(fd);
     free(dup);
-    return (rc == 0) ? (int)size : -EIO;
+    return (rc == 0) ? 0 : -EIO;
+}
+
+int mtp_write_full_fd(const char *path, int fd, size_t size)
+{
+    int rc = mtp_write_send_fd(path, fd, size);
+    return (rc == 0) ? (int)size : rc;
+}
+
+int mtp_write_full(const char *path, const char *buf, size_t size)
+{
+    char tmpl[] = "/tmp/mtpfuse_wrXXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -errno;
+    unlink(tmpl);
+    ssize_t off = 0;
+    while ((size_t)off < size) {
+        ssize_t w = write(fd, buf + off, size - off);
+        if (w <= 0) { close(fd); return -EIO; }
+        off += w;
+    }
+    int rc = mtp_write_send_fd(path, fd, size);
+    close(fd);
+    return (rc == 0) ? (int)size : rc;
+}
+
+int mtp_rename(const char *from, const char *to)
+{
+    if (!from || !to || from[0] != '/' || to[0] != '/')
+        return -EINVAL;
+    if (strcmp(from, to) == 0)
+        return 0;
+
+    char *fpath = strdup(from);
+    char *tpath = strdup(to);
+    if (!fpath || !tpath) {
+        free(fpath);
+        free(tpath);
+        return -ENOMEM;
+    }
+
+    const char *fparent_s, *fname;
+    const char *tparent_s, *tname;
+    if (path_parent_basename(fpath, &fparent_s, &fname) != 0 ||
+        path_parent_basename(tpath, &tparent_s, &tname) != 0) {
+        free(fpath);
+        free(tpath);
+        return -EINVAL;
+    }
+
+    mtp_node_t *orphan_target = NULL;
+
+    pthread_mutex_lock(&g_lock);
+    mtp_node_t *src = resolve(from);
+    if (!src) {
+        pthread_mutex_unlock(&g_lock);
+        free(fpath);
+        free(tpath);
+        return -ENOENT;
+    }
+    if (src == g_root) {
+        pthread_mutex_unlock(&g_lock);
+        free(fpath);
+        free(tpath);
+        return -EACCES;
+    }
+
+    mtp_node_t *dst_parent = resolve(tparent_s);
+    if (!dst_parent || !dst_parent->is_dir || dst_parent == g_root) {
+        pthread_mutex_unlock(&g_lock);
+        free(fpath);
+        free(tpath);
+        return dst_parent ? -EACCES : -ENOENT;
+    }
+
+    mtp_node_t *to_existing = resolve(to);
+    if (to_existing) {
+        if (to_existing->is_dir || src->is_dir) {
+            pthread_mutex_unlock(&g_lock);
+            free(fpath);
+            free(tpath);
+            return (src->is_dir && to_existing->is_dir) ? -EEXIST : -EISDIR;
+        }
+        tree_detach(to_existing);
+        orphan_target = to_existing;
+    }
+
+    mtp_node_t *src_parent = src->parent;
+    uint32_t new_parent_id = mtp_parent_handle(dst_parent);
+    uint32_t new_storage_id = dst_parent->storage_id;
+    uint32_t src_oid = src->object_id;
+    int same_parent = (src_parent == dst_parent);
+    int cross_dir_move = (!same_parent && src->is_dir);
+
+    pthread_mutex_unlock(&g_lock);
+
+    if (orphan_target) {
+        pthread_mutex_lock(&g_mtp);
+        int dr = LIBMTP_Delete_Object(g_device, orphan_target->object_id);
+        if (dr != 0) log_mtp_errors();
+        pthread_mutex_unlock(&g_mtp);
+        pthread_mutex_lock(&g_lock);
+        node_free(orphan_target);
+        pthread_mutex_unlock(&g_lock);
+        if (dr != 0) {
+            free(fpath);
+            free(tpath);
+            return -EIO;
+        }
+    }
+
+    pthread_mutex_lock(&g_mtp);
+    int rc;
+    if (same_parent) {
+        rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
+    } else {
+        rc = LIBMTP_Move_Object(g_device, src_oid, new_parent_id, new_storage_id);
+        if (rc == 0)
+            rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
+    }
+    if (rc != 0) log_mtp_errors();
+    pthread_mutex_unlock(&g_mtp);
+
+    if (rc != 0) {
+        free(fpath);
+        free(tpath);
+        return -EIO;
+    }
+
+    if (cross_dir_move) {
+        free(fpath);
+        free(tpath);
+        mtp_refresh_tree();
+        return 0;
+    }
+
+    char *tname_copy = strdup(tname);
+    if (!tname_copy) {
+        free(fpath);
+        free(tpath);
+        return -ENOMEM;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    src = resolve(from);
+    mtp_node_t *dp = resolve(tparent_s);
+    if (!src || !dp) {
+        pthread_mutex_unlock(&g_lock);
+        free(tname_copy);
+        free(fpath);
+        free(tpath);
+        mtp_refresh_tree();
+        return 0;
+    }
+    if (same_parent) {
+        free(src->name);
+        src->name = tname_copy;
+    } else {
+        tree_detach(src);
+        free(src->name);
+        src->name = tname_copy;
+        src->storage_id = new_storage_id;
+        node_add_child(dp, src);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    free(fpath);
+    free(tpath);
+    return 0;
 }
 
 int mtp_unlink(const char *path)
@@ -659,7 +955,7 @@ int mtp_mkdir(const char *path)
         pthread_mutex_unlock(&g_lock); free(dup); return -EACCES;
     }
     uint32_t storage_id = p->storage_id;
-    uint32_t parent_id  = p->object_id;
+    uint32_t parent_id  = mtp_parent_handle(p);
     pthread_mutex_unlock(&g_lock);
 
     pthread_mutex_lock(&g_mtp);

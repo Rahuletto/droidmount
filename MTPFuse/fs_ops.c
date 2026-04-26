@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,12 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Skip eager prefetch on open for huge files (SD-card videos): Finder
+ * touching them during folder browse won't pull gigabytes up front. */
+#define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)64 * 1024 * 1024)
+
+static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static double fuse_mono_ms(void)
 {
@@ -35,6 +42,7 @@ typedef struct {
     char *path;        /* logical mount path, owned */
     int   dirty;       /* set on any write */
     int   created;     /* file did not exist on device at open */
+    int   cache_ready; /* 1: temp fd has full device payload (see op_read) */
 } handle_t;
 
 static int op_getattr(const char *path, struct stat *st)
@@ -152,8 +160,10 @@ static int op_open(const char *path, struct fuse_file_info *fi)
     if (!h) return -ENOMEM;
 
     int did_prefetch = 0;
-    /* If we may read from it, pull the contents down once. */
-    if ((fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0) {
+    h->cache_ready = 0;
+    /* If we may read from it, pull the contents down once (not for giants). */
+    if ((fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
+        s.size <= MTP_OP_OPEN_PREFETCH_MAX) {
         char *buf = malloc((size_t)s.size);
         if (!buf) { close(h->fd); free(h->path); free(h); return -ENOMEM; }
         int got = mtp_read(path, buf, (size_t)s.size, 0);
@@ -171,17 +181,18 @@ static int op_open(const char *path, struct fuse_file_info *fi)
         }
         free(buf);
         did_prefetch = 1;
+        h->cache_ready = 1;
     }
 
     if (fi->flags & O_TRUNC) {
         ftruncate(h->fd, 0);
         h->dirty = 1;
+        h->cache_ready = 1; /* local empty; do not re-download from device */
     }
     fi->fh = (uint64_t)(uintptr_t)h;
-    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch=%d %.2fms "
-                  "(prefetch downloads whole file from phone)",
+    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch=%d cache_ready=%d %.2fms",
                   path, fi->flags, (unsigned long long)s.size, did_prefetch,
-                  fuse_mono_ms() - t0);
+                  h->cache_ready, fuse_mono_ms() - t0);
     return 0;
 }
 
@@ -192,6 +203,7 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     if (!h) return -ENOMEM;
     h->dirty = 1;
     h->created = 1;
+    h->cache_ready = 1; /* empty staging file; not on device until release */
     fi->fh = (uint64_t)(uintptr_t)h;
     return 0;
 }
@@ -199,9 +211,25 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 static int op_read(const char *path, char *buf, size_t size, off_t offset,
                    struct fuse_file_info *fi)
 {
-    (void)path;
     handle_t *h = (handle_t *)(uintptr_t)fi->fh;
     if (!h) return -EBADF;
+    if (!h->cache_ready) {
+        if (h->created) {
+            /* op_create: nothing on device to pull */
+            h->cache_ready = 1;
+        } else {
+            pthread_mutex_lock(&g_stage_mu);
+            if (!h->cache_ready) {
+                int st = mtp_download_to_fd(path, h->fd);
+                if (st != 0) {
+                    pthread_mutex_unlock(&g_stage_mu);
+                    return st;
+                }
+                h->cache_ready = 1;
+            }
+            pthread_mutex_unlock(&g_stage_mu);
+        }
+    }
     ssize_t r = pread(h->fd, buf, size, offset);
     return (r < 0) ? -errno : (int)r;
 }
@@ -246,18 +274,11 @@ static int op_release(const char *path, struct fuse_file_info *fi)
     int rc = 0;
     if (h->dirty) {
         off_t end = lseek(h->fd, 0, SEEK_END);
-        if (end < 0) end = 0;
-        char *buf = malloc((size_t)end);
-        if (buf) {
-            ssize_t off = 0;
-            while (off < end) {
-                ssize_t r = pread(h->fd, buf + off, end - off, off);
-                if (r <= 0) break;
-                off += r;
-            }
-            int wr = mtp_write_full(h->path, buf, (size_t)off);
+        if (end < 0)
+            rc = -errno;
+        else {
+            int wr = mtp_write_full_fd(h->path, h->fd, (size_t)end);
             if (wr < 0) rc = wr;
-            free(buf);
         }
     }
     close(h->fd);
@@ -266,6 +287,11 @@ static int op_release(const char *path, struct fuse_file_info *fi)
     free(h->path);
     free(h);
     return rc;
+}
+
+static int op_rename(const char *from, const char *to)
+{
+    return mtp_rename(from, to);
 }
 
 static int op_unlink(const char *path)        { return mtp_unlink(path); }
@@ -354,6 +380,7 @@ struct fuse_operations mtpfuse_ops = {
     .release     = op_release,
     .truncate    = op_truncate,
     .ftruncate   = op_ftruncate,
+    .rename      = op_rename,
     .unlink      = op_unlink,
     .mkdir       = op_mkdir,
     .rmdir       = op_rmdir,

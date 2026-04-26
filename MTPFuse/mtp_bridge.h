@@ -54,9 +54,20 @@ void mtp_readdir_snapshot_free(mtp_dirent_t *entries, size_t n);
  * Returns bytes read or -errno. */
 int  mtp_read(const char *path, char *buf, size_t size, off_t offset);
 
+/* Pull the full object from the device into [fd] (truncated, seek 0). For
+ * large files when op_open skips prefetch. Returns 0 or -errno. */
+int  mtp_download_to_fd(const char *path, int fd);
+
 /* Replace the file at [path] with [size] bytes from [buf]. Creates the
  * file if it does not exist. Returns bytes written or -errno. */
 int  mtp_write_full(const char *path, const char *buf, size_t size);
+
+/* Same as mtp_write_full but reads payload from [fd] at offset 0 (after
+ * optional internal lseek). Avoids malloc(filesize) on release. */
+int  mtp_write_full_fd(const char *path, int fd, size_t size);
+
+/* Rename or move within the device (MTP Set_Object_Filename / Move_Object). */
+int  mtp_rename(const char *from, const char *to);
 
 /* Unlink (delete) a file. */
 int  mtp_unlink(const char *path);

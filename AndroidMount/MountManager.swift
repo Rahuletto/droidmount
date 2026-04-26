@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 
+/// One macFUSE + mtpfuse process per USB location (supports several phones at once).
 final class MountManager {
     enum MountError: LocalizedError {
         case helperMissing
@@ -18,73 +19,72 @@ final class MountManager {
         }
     }
 
-    // /Volumes is root-owned on modern macOS; use a path the user owns.
-    // The macFUSE `local` + `volname` options still make Finder show
-    // this as a normal sidebar volume. Each device gets its own
-    // subdirectory named after the phone, e.g. ~/AndroidMount/Find 5.
-    // Hidden by default (prefixed with .)
-    private let parentDir: String = "\(NSHomeDirectory())/.AndroidMount"
-    private var mountPoint: String = ""
-    private var process: Process?
+    private struct Session {
+        let mountPoint: String
+        let process: Process
+    }
 
-    func mount(deviceName: String, completion: @escaping (Result<String, Error>) -> Void) {
+    private let parentDir: String = "\(NSHomeDirectory())/.AndroidMount"
+    /// Finder / sidebar volume icon (macFUSE `volicon=`).
+    private let volumeIconPath =
+        "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/com.apple.iphone.icns"
+
+    private var sessions: [UInt32: Session] = [:]
+    private let sessionsLock = NSLock()
+
+    /// Mount one device; idempotent if already mounted for this `locationID`.
+    func mount(device: USBDevice, completion: @escaping (Result<String, Error>) -> Void) {
+        sessionsLock.lock()
+        if let existing = sessions[device.locationID] {
+            sessionsLock.unlock()
+            completion(.success(existing.mountPoint))
+            return
+        }
+        sessionsLock.unlock()
+
         guard let helper = locateHelper() else {
             completion(.failure(MountError.helperMissing))
             return
         }
 
-        // Per-device subdirectory: ~/AndroidMount/<DeviceName>
-        let safeDir = deviceName
+        let safeDir = device.name
             .replacingOccurrences(of: "/", with: "_")
             .trimmingCharacters(in: .whitespaces)
-        mountPoint = "\(parentDir)/\(safeDir.isEmpty ? "Device" : safeDir)"
+        let tag = String(format: "%08x", device.locationID)
+        let base = safeDir.isEmpty ? "Device" : safeDir
+        let mountPoint = "\(parentDir)/\(base)_\(tag)"
 
-        // Ensure mountpoint exists; reclaim stale FUSE mounts from a prior crash / quit
-        do { try ensureMountpoint() } catch {
-            completion(.failure(error)); return
+        do {
+            try ensureMountpoint(at: mountPoint)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+
+        let safeVol = device.name
+            .replacingOccurrences(of: ",", with: "")
+            .replacingOccurrences(of: " ", with: "_")
+
+        var fuseOpts =
+            "direct_io,noappledouble,noapplexattr,noatime,max_readahead=0," +
+            "iosize=1048576,daemon_timeout=300," +
+            "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
+            ",volname=\(safeVol)"
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: volumeIconPath) {
+            fuseOpts += ",volicon=\(volumeIconPath)"
         }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: helper)
-        // -f keeps fuse in foreground so process termination unmounts it.
-        // `local` makes Finder treat it as a real local volume (sidebar).
-        // Volume name is sanitized for FUSE option parsing (no commas/spaces).
-        let safe = deviceName
-            .replacingOccurrences(of: ",", with: "")
-            .replacingOccurrences(of: " ", with: "_")
-// Important option choices for MTP-via-FUSE:
-        //   * NO local — prevent Finder sidebar/auto-indexing
-        //   * direct_io,noatime — reduce overhead
-        //   * long timeouts for slow MTP
-        p.arguments = [
-            "-f",
-            "-o",
-            "direct_io,noappledouble,noapplexattr,noatime,max_readahead=0," +
-            "iosize=1048576,daemon_timeout=300," +
-            "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
-            ",volname=\(safe)",
-            mountPoint
-        ]
+        p.arguments = ["-f", "-o", fuseOpts, mountPoint]
 
-        // Disable Spotlight indexing on the mount point after mount
-        let mp = mountPoint
-        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
-            // Create .no_index to tell Spotlight to skip
-            let noIndex = "\(mp)/.metadata_never_index"
-            _ = FileManager.default.createFile(atPath: noIndex, contents: nil)
-            // Set xattr to exclude from Spotlight
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            task.arguments = ["-w", "-s", "com.apple.metadata.spotlight.indexing-disable", "1", mp]
-            try? task.run()
-            task.waitUntilExit()
-        }
-
-        // Inherit env so DYLD finds libmtp/macfuse
         var env = ProcessInfo.processInfo.environment
         env["DYLD_FALLBACK_LIBRARY_PATH"] =
             "/opt/homebrew/lib:/usr/local/lib:/Library/Frameworks/macFUSE.framework/Versions/A:" +
             (env["DYLD_FALLBACK_LIBRARY_PATH"] ?? "")
+        env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
         p.environment = env
 
         let errPipe = Pipe()
@@ -106,62 +106,119 @@ final class MountManager {
 
         do {
             try p.run()
-            self.process = p
-            // Poll for the mount up to ~8s
-            DispatchQueue.global().async {
+            DispatchQueue.global().async { [weak self] in
+                guard let self = self else { return }
                 for _ in 0..<40 {
                     Thread.sleep(forTimeInterval: 0.2)
-                    if self.isMounted() {
-                        returnOnce(.success(self.mountPoint))
+                    if self.isFuseMounted(at: mountPoint) {
+                        self.sessionsLock.lock()
+                        self.sessions[device.locationID] = Session(mountPoint: mountPoint, process: p)
+                        self.sessionsLock.unlock()
+                        returnOnce(.success(mountPoint))
                         return
                     }
                     if !p.isRunning { break }
+                }
+                if p.isRunning {
+                    p.terminate()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+                        if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                    }
                 }
                 returnOnce(.failure(MountError.mountFailed("timed out waiting for mount")))
             }
         } catch {
             completion(.failure(error))
         }
+
+        let mp = mountPoint
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
+            let noIndex = "\(mp)/.metadata_never_index"
+            _ = FileManager.default.createFile(atPath: noIndex, contents: nil)
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            task.arguments = ["-w", "-s", "com.apple.metadata.spotlight.indexing-disable", "1", mp]
+            try? task.run()
+            task.waitUntilExit()
+        }
     }
 
-    func unmount() {
-        let mp = mountPoint  // capture before we nil it
-        // Try a clean unmount via diskutil first
-        let du = Process()
-        du.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-        du.arguments = ["unmount", "force", mp]
-        du.standardOutput = Pipe(); du.standardError = Pipe()
-        try? du.run(); du.waitUntilExit()
+    func unmount(locationID: UInt32? = nil) {
+        sessionsLock.lock()
+        let targets: [UInt32: Session]
+        if let id = locationID {
+            if let s = sessions.removeValue(forKey: id) {
+                targets = [id: s]
+            } else {
+                targets = [:]
+            }
+        } else {
+            targets = sessions
+            sessions.removeAll()
+        }
+        sessionsLock.unlock()
 
-        if let p = process, p.isRunning {
+        for (_, s) in targets {
+            tearDown(session: s)
+        }
+    }
+
+    private func tearDown(session: Session) {
+        let mp = session.mountPoint
+        let p = session.process
+
+        if p.isRunning {
             p.terminate()
-            // give it a beat, then SIGKILL
-            DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) {
-                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+        }
+        var waited = 0
+        while p.isRunning && waited < 80 {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 1
+        }
+        if p.isRunning {
+            kill(p.processIdentifier, SIGKILL)
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+
+        for pid in mtpfusePids(usingMountPoint: mp) {
+            kill(pid, SIGTERM)
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+        for pid in mtpfusePids(usingMountPoint: mp) {
+            kill(pid, SIGKILL)
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+
+        runDiskutilUnmountForce(mp)
+        Thread.sleep(forTimeInterval: 0.15)
+        runDiskutilUnmountForce(mp)
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self = self else { return }
+            if !self.isFuseMounted(at: mp) {
+                try? FileManager.default.removeItem(atPath: mp)
             }
         }
-        process = nil
-
-        // Clean up the mount directory after unmount
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
-            try? FileManager.default.removeItem(atPath: mp)
-        }
     }
 
-    private func isMounted() -> Bool {
+    func mountPoint(for locationID: UInt32) -> String? {
+        sessionsLock.lock()
+        defer { sessionsLock.unlock() }
+        return sessions[locationID]?.mountPoint
+    }
+
+    // MARK: - Mount point helpers
+
+    private func isFuseMounted(at path: String) -> Bool {
         var st = statfs()
-        guard statfs(mountPoint, &st) == 0 else { return false }
-        // After macFUSE mounts, f_fstypename becomes "macfuse" (or
-        // "osxfuse" on legacy versions). The underlying APFS dir would
-        // report "apfs". This check works regardless of how macFUSE
-        // normalizes the mount path string.
+        guard statfs(path, &st) == 0 else { return false }
         let fstype = withUnsafeBytes(of: &st.f_fstypename) { raw -> String in
             String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
         }
         return fstype.contains("fuse") || fstype.contains("macfuse")
     }
 
-    private func ensureMountpoint() throws {
+    private func ensureMountpoint(at mountPoint: String) throws {
         let fm = FileManager.default
         if !fm.fileExists(atPath: parentDir) {
             try fm.createDirectory(atPath: parentDir,
@@ -172,16 +229,14 @@ final class MountManager {
                 withIntermediateDirectories: true, attributes: nil)
             return
         }
-        // Stale macFUSE mount: app restarted but mtpfuse still holds the path
-        if isMounted() {
+        if isFuseMounted(at: mountPoint) {
             reclaimStaleFuseMount(at: mountPoint)
-            if isMounted() {
+            if isFuseMounted(at: mountPoint) {
                 throw MountError.mountpointBusy
             }
         }
     }
 
-    /// Force-unmount and kill orphaned `mtpfuse` for this path (e.g. after Finder freeze / crash).
     private func reclaimStaleFuseMount(at path: String) {
         runDiskutilUnmountForce(path)
         for pid in mtpfusePids(usingMountPoint: path) {
@@ -193,23 +248,16 @@ final class MountManager {
         }
         Thread.sleep(forTimeInterval: 0.2)
         runDiskutilUnmountForce(path)
-        // Drop stale helper reference if it was ours but the process table still matched
-        if let p = process, !p.isRunning {
-            process = nil
-        }
     }
 
     private func runDiskutilUnmountForce(_ path: String) {
         let du = Process()
         du.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
         du.arguments = ["unmount", "force", path]
-        du.standardOutput = Pipe()
-        du.standardError = Pipe()
-        try? du.run()
-        du.waitUntilExit()
+        du.standardOutput = Pipe(); du.standardError = Pipe()
+        try? du.run(); du.waitUntilExit()
     }
 
-    /// PIDs of `mtpfuse` whose argv contains this exact mount path (not AndroidMount itself).
     private func mtpfusePids(usingMountPoint path: String) -> [pid_t] {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -217,11 +265,7 @@ final class MountManager {
         let out = Pipe()
         task.standardOutput = out
         task.standardError = Pipe()
-        do {
-            try task.run()
-        } catch {
-            return []
-        }
+        do { try task.run() } catch { return [] }
         task.waitUntilExit()
         let data = out.fileHandleForReading.readDataToEndOfFile()
         guard let text = String(data: data, encoding: .utf8) else { return [] }
@@ -253,7 +297,6 @@ final class MountManager {
         candidates.append("\(exeDir)/mtpfuse")
         candidates.append("/usr/local/bin/mtpfuse")
         candidates.append("/opt/homebrew/bin/mtpfuse")
-        // Dev fallback: alongside the project
         candidates.append(FileManager.default.currentDirectoryPath + "/mtpfuse")
         return candidates.first { fm.isExecutableFile(atPath: $0) }
     }
