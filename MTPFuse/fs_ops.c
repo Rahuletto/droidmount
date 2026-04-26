@@ -8,8 +8,10 @@
  * file is larger than MTP_OP_OPEN_PREFETCH_MAX, read-only (or read‑first
  * RDWR) opens stream via libmtp partial reads instead of a multi‑GB
  * Get_File, which avoids Finder “device disappeared” on long USB pulls.
- * On release, if the file was written, the staging file is pushed with
- * mtp_write_full_fd().
+ * On release, if the file was written, the staging fd is passed to
+ * mtp_write_full_fd() → LIBMTP_Send_File_From_File_Descriptor, which streams
+ * bytes from that fd to the device (no extra full-file copy). Staging uses
+ * TMPDIR. op_flush fsyncs dirty handles so data is durable before close/upload.
  *
  * Integrity (multi‑GB safe):
  *   • Writes loop pwrite(2) until the full Finder buffer is persisted or errno.
@@ -57,6 +59,7 @@ typedef struct {
 static void mtp_inval_one_volume_path(const char *path, void *ctx)
 {
     mtp_inval_vol_ctx_t *c = (mtp_inval_vol_ctx_t *)ctx;
+    mtp_invalidate_fuse_dir_cache(path);
     int ir = fuse_invalidate_path(c->f, path);
     if (ir < 0 && ir != -ENOENT)
         mtp_debug_log("fuse_invalidate_path(%s) rc=%d", path, ir);
@@ -66,8 +69,8 @@ static void *mtp_remote_inval_loop(void *arg)
 {
     (void)arg;
     while (!g_mtpfuse_remote_inval_stop) {
-        /* 15s: less Finder UI churn than 3s; invalidating "/" made the drive icon flicker. */
-        for (int n = 0; n < 150 && !g_mtpfuse_remote_inval_stop; n++)
+        /* 60s: periodic invalidation competes with Finder navigation. */
+        for (int n = 0; n < 600 && !g_mtpfuse_remote_inval_stop; n++)
             usleep(100000);
         struct fuse *f = g_mtpfuse_handle;
         if (!f || g_mtpfuse_remote_inval_stop)
@@ -644,12 +647,17 @@ static int op_fgetattr(const char *path, struct stat *st, struct fuse_file_info 
         return 0;
     if (!S_ISREG(st->st_mode))
         return 0;
-    /* Keep fstat size aligned with the open handle (listing can lag libmtp). */
-    if (!h->created && h->remote_size > 0 &&
-        (uint64_t)st->st_size != h->remote_size) {
-        if (h->remote_size <= (uint64_t)OFF_MAX)
-            st->st_size = (off_t)h->remote_size;
+    /* While writing, st_size must reflect staging (device lags until release). */
+    if (h->dirty || h->created) {
+        struct stat fst;
+        if (fstat(h->fd, &fst) == 0)
+            st->st_size = fst.st_size;
+        return 0;
     }
+    /* getattr/mtp_stat already refreshed device metadata; never shrink st_size
+     * to open-time h->remote_size (stale after rename / external change → corrupt reads). */
+    if (st->st_size >= 0 && (uint64_t)st->st_size <= (uint64_t)OFF_MAX)
+        h->remote_size = (uint64_t)st->st_size;
     return 0;
 }
 
@@ -752,14 +760,12 @@ static handle_t *make_handle(const char *path)
         free(h);
         return NULL;
     }
-    char tmpl[] = "/tmp/mtpfuse_hXXXXXX";
-    h->fd = mkstemp(tmpl);
+    h->fd = mtp_anon_tempfile_fd("mtpfuse_h");
     if (h->fd < 0) {
         free(h->path);
         free(h);
         return NULL;
     }
-    unlink(tmpl);
     return h;
 }
 
@@ -786,7 +792,7 @@ static int op_open(const char *path, struct fuse_file_info *fi)
 {
     double t0 = fuse_mono_ms();
     mtp_stat_t s;
-    int rc = mtp_stat(path, &s);
+    int rc = mtp_stat_refresh(path, &s);
     if (rc != 0) return rc;
     if (s.is_dir) return -EISDIR;
 
@@ -895,9 +901,26 @@ static int op_write(const char *path, const char *buf, size_t size, off_t offset
 
 static int op_truncate(const char *path, off_t size)
 {
-    /* Best-effort: only meaningful while a handle is open. We allow it
-     * silently so that editors that truncate-then-write can succeed. */
-    (void)path; (void)size;
+    if (size < 0)
+        return -EINVAL;
+    /* Finder sometimes truncate(2)s the path during create/copy before our fd is visible
+     * as ftruncate; pending creates must resize staging or the object ships wrong length. */
+    pthread_mutex_lock(&g_pending_mu);
+    for (pending_create_t *e = g_pending_creates; e; e = e->next) {
+        if (strcmp(e->path, path) != 0)
+            continue;
+        handle_t *ph = e->h;
+        if (!ph || ph->fd < 0)
+            continue;
+        pthread_mutex_unlock(&g_pending_mu);
+        if (ftruncate(ph->fd, size) < 0)
+            return -errno;
+        ph->dirty = 1;
+        return 0;
+    }
+    pthread_mutex_unlock(&g_pending_mu);
+    /* Path-only truncate on existing MTP files: open handles use op_ftruncate. */
+    (void)path;
     return 0;
 }
 
@@ -919,8 +942,14 @@ static int op_ftruncate(const char *path, off_t size, struct fuse_file_info *fi)
 static int op_flush(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
-    /* Staging fd is private; nothing to push until release unless dirty. */
-    (void)fi;
+    handle_t *h = (handle_t *)(uintptr_t)fi->fh;
+    if (!h || !h->path)
+        return 0;
+    /* Push staging data to backing store before release starts MTP send. */
+    if (h->dirty || h->created) {
+        if (fsync(h->fd) != 0)
+            return -errno;
+    }
     return 0;
 }
 
@@ -1084,7 +1113,7 @@ static int op_renamex(const char *from, const char *to, unsigned int flags)
         return -EINVAL;
     if (flags & (unsigned)RENAME_EXCL) {
         mtp_stat_t sx;
-        int sr = mtp_stat(to, &sx);
+        int sr = mtp_stat_refresh(to, &sx);
         if (sr == 0)
             return -EEXIST;
         if (sr != -ENOENT)

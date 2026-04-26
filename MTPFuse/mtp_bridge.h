@@ -21,6 +21,9 @@ void mtp_close(void);
  * match the in-mount tree and per-storage totals are correct. */
 void mtp_set_fuse_mount_point(const char *mountpoint);
 
+/* Anonymous disk staging file under TMPDIR (unlinked immediately). Returns fd or -errno. */
+int mtp_anon_tempfile_fd(const char *stem);
+
 /* Walk the entire device tree once and populate the id<->path cache.
  * Safe to call multiple times — refreshes the cache. */
 int  mtp_refresh_tree(void);
@@ -40,6 +43,8 @@ typedef struct {
 } mtp_stat_t;
 
 int  mtp_stat(const char *path, mtp_stat_t *out);
+/* Like mtp_stat but always syncs file size/mtime from the device (open, rename checks). */
+int  mtp_stat_refresh(const char *path, mtp_stat_t *out);
 
 /* One directory level from cache (after MTP fetch for that folder only).
  * Snapshot is malloc'd; free with mtp_readdir_snapshot_free. */
@@ -97,6 +102,9 @@ int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t
 
 /* Invoke [cb] with "/StorageName" for each top-level storage dir (not mount "/"). */
 void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx), void *ctx);
+
+/* Drop cached children under this in-mount path; next readdir refetches from the device. */
+void mtp_invalidate_fuse_dir_cache(const char *fuse_path);
 
 /* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */
 int mtp_root_volume_icon_active(void);

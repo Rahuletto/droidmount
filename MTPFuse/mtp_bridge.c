@@ -8,10 +8,12 @@
  * resolve() walks path components and calls load_children() only on
  * each ancestor — never recursively prefetches deeper folders.
  *
- * Phone apps / other PCs change MTP objects without notifying us.
- * mtp_readdir_snapshot() therefore drops the in-memory listing for that
- * directory before each readdir so Finder matches the device (MTP has no
- * push sync).
+ * Phone apps / other PCs change MTP objects without notifying us — listings are
+ * cached and invalidated periodically / after local writes (see mtp_invalidate_fuse_dir_cache).
+ *
+ * Uploads: FUSE writes to one unlinked staging file; on close we call
+ * LIBMTP_Send_File_From_File_Descriptor, which streams from that fd to USB — no
+ * second full-file copy in userspace (only mtp_write_full’s rare buf path buffers once).
  *
  * Locking (deadlock avoidance):
  *   • g_lock  — in-memory tree; callers hold it across resolve/load_children.
@@ -51,6 +53,9 @@ typedef struct mtp_node {
     int              is_synth;     /* 1: macOS Finder metadata path, not on device */
     uint64_t         size;
     uint64_t         mtime;
+    double           meta_cached_at; /* now_sec() after last Get_Filemetadata sync (files) */
+    int              load_busy;      /* directory listing in progress (other ops wait) */
+    uint32_t         load_gen;       /* bumped when cache dropped; stale loaders discard */
     int              children_loaded;
     struct mtp_node *parent;
     struct mtp_node *first_child;
@@ -69,7 +74,53 @@ static pthread_mutex_t     g_mtp    = PTHREAD_MUTEX_INITIALIZER;
 /* -1 = unknown, 0 = no, 1 = yes (LIBMTP_DEVICECAP_GetPartialObject). */
 static int g_cap_partial_get = -1;
 
+/* LIBMTP_Get_Storage is slow; statfs + pre-copy checks poll it often. */
+static const double k_mtp_storage_cache_ttl_sec = 4.0;
+/* Finder issues many getattrs; full Get_Filemetadata each time serializes on g_mtp and freezes UI.
+ * Reads/downloads always refresh separately. Override with MTP_STAT_META_TTL_SEC (0 = every stat). */
+static const double k_mtp_stat_meta_ttl_sec_default = 8.0;
+
+static pthread_cond_t  g_dir_load_cv = PTHREAD_COND_INITIALIZER;
+/* Async folder listing runs Get_Children + metadata without g_lock so Finder can
+ * getattr/readdir other paths. mtp_close / mtp_refresh_tree wait for inflight==0. */
+static pthread_mutex_t g_tree_async_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_tree_async_cv = PTHREAD_COND_INITIALIZER;
+static int             g_tree_async_inflight;
+static int             g_tree_async_pause;
+static int             g_tree_async_closing;
+
+typedef struct {
+    uint32_t id;
+    uint64_t max_cap;
+    uint64_t free_bytes;
+} mtp_stor_snap_t;
+
+static mtp_stor_snap_t g_st_cache[64];
+static size_t          g_st_cache_n;
+static double          g_st_cache_mono = -1e9;
+
 static void log_mtp_errors(void);
+static double now_sec(void);
+
+int mtp_anon_tempfile_fd(const char *stem)
+{
+    if (!stem || !stem[0])
+        return -EINVAL;
+    char tmpl[PATH_MAX];
+    const char *d = getenv("TMPDIR");
+    if (!d || !d[0])
+        d = "/tmp";
+    size_t dl = strlen(d);
+    int n = snprintf(tmpl, sizeof tmpl, "%s%s%sXXXXXX", d,
+                     (dl > 0 && d[dl - 1] == '/') ? "" : "/", stem);
+    if (n < 0 || (size_t)n >= sizeof tmpl)
+        return -ENAMETOOLONG;
+    int fd = mkstemp(tmpl);
+    if (fd < 0)
+        return -errno;
+    unlink(tmpl);
+    return fd;
+}
 
 /* USB MTP stacks often flake with a single NAK; Finder maps hard I/O failure
  * to “The device disappeared.” Multi-level retries cover long full-file pulls. */
@@ -212,31 +263,115 @@ static int mtp_delete_object_retry(uint32_t oid)
     return -1;
 }
 
-/* Refresh size + modification time from the device. Caller must hold g_lock;
- * briefly takes g_mtp (same nesting order as load_children).
- *
- * Always re-query files by object id: many stacks (especially for video) report
- * plausible but wrong non-zero sizes in cached tree state. Using that for
- * GetPartialObject length or for post-download ftruncate produces truncated
- * MP4/MOV bytes — QuickTime and on-device players then fail. */
-static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
+/* File metadata refresh must not run mtp_usb_backoff() while holding g_lock:
+ * Finder would freeze for the whole mount until USB retries finish. */
+static mtp_node_t *resolve(const char *path);
+
+static double stat_meta_ttl_sec(void)
 {
-    if (!n || n->is_synth)
-        return;
-    if (n->object_id == 0 || n->is_dir)
-        return;
-    pthread_mutex_lock(&g_mtp);
-    if (!g_device) {
-        pthread_mutex_unlock(&g_mtp);
-        return;
+    static double cache = -1.0;
+    if (cache >= 0.0)
+        return cache;
+    const char *e = getenv("MTP_STAT_META_TTL_SEC");
+    if (e && e[0]) {
+        char *end = NULL;
+        double v = strtod(e, &end);
+        if (end != e && v >= 0.0 && v <= 600.0) {
+            cache = v;
+            return cache;
+        }
     }
-    LIBMTP_file_t *f = LIBMTP_Get_Filemetadata(g_device, n->object_id);
-    pthread_mutex_unlock(&g_mtp);
-    if (!f)
+    cache = k_mtp_stat_meta_ttl_sec_default;
+    return cache;
+}
+
+static mtp_node_t *node_find_by_object_id(mtp_node_t *r, uint32_t oid)
+{
+    if (!r || oid == 0u)
+        return NULL;
+    if (!r->is_dir && r->object_id == oid)
+        return r;
+    for (mtp_node_t *c = r->first_child; c; c = c->next_sibling) {
+        mtp_node_t *h = node_find_by_object_id(c, oid);
+        if (h)
+            return h;
+    }
+    return NULL;
+}
+
+/* Returns 0 if skipped (dir/synth/no oid) or updated; -1 if metadata missing. */
+static int refresh_file_meta_for_path(const char *path_use)
+{
+    if (!path_use)
+        return -1;
+    for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+        if (k > 0)
+            mtp_usb_backoff((unsigned)k);
+        pthread_mutex_lock(&g_lock);
+        mtp_node_t *n = resolve(path_use);
+        if (!n) {
+            pthread_mutex_unlock(&g_lock);
+            return -1;
+        }
+        if (n->is_synth || n->is_dir || n->object_id == 0u) {
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        uint32_t oid = n->object_id;
+        pthread_mutex_unlock(&g_lock);
+
+        pthread_mutex_lock(&g_mtp);
+        LIBMTP_file_t *f = NULL;
+        if (g_device)
+            f = LIBMTP_Get_Filemetadata(g_device, oid);
+        pthread_mutex_unlock(&g_mtp);
+        if (f) {
+            uint64_t sz = f->filesize;
+            uint64_t mt = (uint64_t)f->modificationdate;
+            LIBMTP_destroy_file_t(f);
+            pthread_mutex_lock(&g_lock);
+            n = resolve(path_use);
+            if (n && !n->is_synth && !n->is_dir && n->object_id == oid) {
+                n->size  = sz;
+                n->mtime = mt;
+                n->meta_cached_at = now_sec();
+            }
+            pthread_mutex_unlock(&g_lock);
+            return 0;
+        }
+        log_mtp_errors();
+    }
+    return -1;
+}
+
+static void refresh_meta_by_oid_for_tree(uint32_t oid)
+{
+    if (oid == 0u)
         return;
-    n->size  = f->filesize;
-    n->mtime = (uint64_t)f->modificationdate;
-    LIBMTP_destroy_file_t(f);
+    for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+        if (k > 0)
+            mtp_usb_backoff((unsigned)k);
+        pthread_mutex_lock(&g_mtp);
+        LIBMTP_file_t *f = NULL;
+        if (g_device)
+            f = LIBMTP_Get_Filemetadata(g_device, oid);
+        pthread_mutex_unlock(&g_mtp);
+        if (f) {
+            uint64_t sz = f->filesize;
+            uint64_t mt = (uint64_t)f->modificationdate;
+            LIBMTP_destroy_file_t(f);
+            pthread_mutex_lock(&g_lock);
+            mtp_node_t *hit = node_find_by_object_id(g_root, oid);
+            if (hit && !hit->is_synth && !hit->is_dir) {
+                hit->size  = sz;
+                hit->mtime = mt;
+                hit->meta_cached_at = now_sec();
+            }
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+        log_mtp_errors();
+    }
 }
 
 /* ---------- helpers ---------- */
@@ -326,11 +461,90 @@ static uint32_t node_effective_storage_id(const mtp_node_t *n)
     return 0u;
 }
 
+/* Re-find a directory after async load (pointer [dir] may not be validated across g_lock). */
+static mtp_node_t *node_find_dir_by_key(mtp_node_t *r, uint32_t sid, uint32_t oid)
+{
+    if (!r)
+        return NULL;
+    if (r->is_dir && !r->is_synth && node_effective_storage_id(r) == sid && r->object_id == oid)
+        return r;
+    for (mtp_node_t *c = r->first_child; c; c = c->next_sibling) {
+        mtp_node_t *h = node_find_dir_by_key(c, sid, oid);
+        if (h)
+            return h;
+    }
+    return NULL;
+}
+
+static void free_built_child_chain(mtp_node_t *head)
+{
+    while (head) {
+        mtp_node_t *nx = head->next_sibling;
+        head->next_sibling = NULL;
+        node_free(head);
+        head = nx;
+    }
+}
+
+static int tree_async_begin(void)
+{
+    pthread_mutex_lock(&g_tree_async_mu);
+    if (g_tree_async_pause || g_tree_async_closing) {
+        pthread_mutex_unlock(&g_tree_async_mu);
+        return -1;
+    }
+    g_tree_async_inflight++;
+    pthread_mutex_unlock(&g_tree_async_mu);
+    return 0;
+}
+
+static void tree_async_end(void)
+{
+    pthread_mutex_lock(&g_tree_async_mu);
+    g_tree_async_inflight--;
+    pthread_cond_broadcast(&g_tree_async_cv);
+    pthread_mutex_unlock(&g_tree_async_mu);
+}
+
 static double now_sec(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static void storage_cache_invalidate_unlocked(void)
+{
+    g_st_cache_n = 0;
+    g_st_cache_mono = -1e9;
+}
+
+/* Precondition: g_mtp held. */
+static int storage_cache_ensure_fresh_unlocked(void)
+{
+    if (!g_device)
+        return -ENODEV;
+    double now = now_sec();
+    if (g_st_cache_n > 0 && (now - g_st_cache_mono) < k_mtp_storage_cache_ttl_sec)
+        return 0;
+    LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
+    g_st_cache_n = 0;
+    for (LIBMTP_devicestorage_t *s = g_device->storage;
+         s && g_st_cache_n < sizeof(g_st_cache) / sizeof(g_st_cache[0]); s = s->next) {
+        g_st_cache[g_st_cache_n].id = s->id;
+        g_st_cache[g_st_cache_n].max_cap = s->MaxCapacity;
+        g_st_cache[g_st_cache_n].free_bytes = s->FreeSpaceInBytes;
+        g_st_cache_n++;
+    }
+    g_st_cache_mono = now;
+    return 0;
+}
+
+static void mtp_storage_cache_bust(void)
+{
+    pthread_mutex_lock(&g_mtp);
+    storage_cache_invalidate_unlocked();
+    pthread_mutex_unlock(&g_mtp);
 }
 
 #if defined(__APPLE__)
@@ -431,6 +645,7 @@ static void dir_drop_children_locked(mtp_node_t *dir)
 {
     if (!dir || !dir->is_dir)
         return;
+    dir->load_gen++;
     mtp_node_t *c = dir->first_child;
     dir->first_child = NULL;
     dir->children_loaded = 0;
@@ -465,21 +680,42 @@ static int mtp_skip_hidden_dot_filenames(void)
     return cached;
 }
 
-/* Caller must hold g_lock for the whole call; do not drop it here.
- * (Dropping g_lock during MTP raced with readdir snapshots → corrupt names.) */
+static int mtp_load_trace_stderr(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("MTPFUSE_VERBOSE_LOAD");
+        v = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+/* Caller must hold g_lock. Serializes per-directory listing so two FUSE threads
+ * do not duplicate Get_Children storms. Non-root listings drop g_lock during
+ * USB (see g_tree_async_*); root stays under g_lock (few storages). */
 static void load_children(mtp_node_t *dir)
 {
-    if (!dir->is_dir || dir->children_loaded) return;
+    if (!dir->is_dir || dir->children_loaded)
+        return;
+    if (dir->load_busy) {
+        while (dir->load_busy)
+            pthread_cond_wait(&g_dir_load_cv, &g_lock);
+        return;
+    }
+    dir->load_busy = 1;
 
     double t0 = now_sec();
+    int trace = mtp_load_trace_stderr();
 
     if (dir == g_root) {
         mtp_debug_log("[LOAD] root start");
-        fprintf(stderr, "[LOAD] root start\n");
-        fflush(stderr);
+        if (trace) {
+            fprintf(stderr, "[LOAD] root start\n");
+            fflush(stderr);
+        }
         if (!g_device) {
             dir->children_loaded = 1;
-            return;
+            goto load_done;
         }
         /* Some phones report NULL/duplicate StorageDescription for multiple
          * volumes; skipping the second hid entire storages (e.g. only “SD card”). */
@@ -519,6 +755,7 @@ static void load_children(mtp_node_t *dir)
             }
             if (dir->first_child)
                 break;
+            /* Do not drop g_lock during backoff: mtp_close may tear down the tree. */
             mtp_usb_backoff((unsigned)(attempt + 1u));
         }
 #if defined(__APPLE__)
@@ -526,20 +763,31 @@ static void load_children(mtp_node_t *dir)
 #endif
         dir->children_loaded = 1;
         mtp_debug_log("[LOAD] root done %.3fs", now_sec() - t0);
-        fprintf(stderr, "[LOAD] root done %.3fs\n", now_sec() - t0);
-        fflush(stderr);
-        return;
+        if (trace) {
+            fprintf(stderr, "[LOAD] root done %.3fs\n", now_sec() - t0);
+            fflush(stderr);
+        }
+        goto load_done;
     }
 
     uint32_t sid = dir->storage_id;
     uint32_t pid = mtp_parent_handle(dir);
+    uint32_t dir_key_sid = node_effective_storage_id(dir);
+    uint32_t dir_key_oid = dir->object_id;
+    uint32_t gen_start = dir->load_gen;
     const char *dbg = dir->name ? dir->name : "?";
 
     mtp_debug_log("[LOAD] \"%s\" sid=%u parent_id=0x%x → Get_Children + per-object metadata",
                   dbg, sid, pid);
-    fprintf(stderr, "[LOAD] \"%s\" sid=%u parent_id=0x%x (MTP listing)…\n",
-            dbg, sid, pid);
-    fflush(stderr);
+    if (trace) {
+        fprintf(stderr, "[LOAD] \"%s\" sid=%u parent_id=0x%x (MTP listing)…\n",
+                dbg, sid, pid);
+        fflush(stderr);
+    }
+
+    int async_ok = (tree_async_begin() == 0);
+    if (async_ok)
+        pthread_mutex_unlock(&g_lock);
 
     uint32_t *ids = NULL;
     int nkids = -1;
@@ -553,9 +801,9 @@ static void load_children(mtp_node_t *dir)
         if (!g_device) {
             pthread_mutex_unlock(&g_mtp);
             free(ids);
-            if (!dir->children_loaded)
-                dir->children_loaded = 1;
-            return;
+            ids = NULL;
+            nkids = -1;
+            break;
         }
         nkids = LIBMTP_Get_Children(g_device, sid, pid, &ids);
         pthread_mutex_unlock(&g_mtp);
@@ -567,87 +815,134 @@ static void load_children(mtp_node_t *dir)
     mtp_debug_log("[LOAD] \"%s\" Get_Children → n=%d elapsed %.3fs",
                   dbg, nkids, now_sec() - t0);
 
-    if (nkids < 0) {
+    mtp_node_t *built = NULL;
+    int count = 0;
+    int meta_aborted = 0;
+
+    if (nkids > 0) {
+        for (int i = 0; i < nkids; i++) {
+            pthread_mutex_lock(&g_mtp);
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                meta_aborted = 1;
+                break;
+            }
+            LIBMTP_file_t *file = LIBMTP_Get_Filemetadata(g_device, ids[i]);
+            pthread_mutex_unlock(&g_mtp);
+
+            if (file) {
+                int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
+                if (file->filename && file->filename[0] &&
+                    !(mtp_skip_hidden_dot_filenames() && file->filename[0] == '.')) {
+                    mtp_node_t *n = node_new(file->filename, is_dir,
+                                             file->item_id, file->storage_id);
+                    if (n) {
+                        n->size  = file->filesize;
+                        n->mtime = file->modificationdate;
+                        if (!is_dir)
+                            n->meta_cached_at = now_sec();
+                        n->next_sibling = built;
+                        built = n;
+                        count++;
+                        if (trace && (count % 200) == 0) {
+                            mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
+                                          dbg, count, now_sec() - t0);
+                            fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
+                            fflush(stderr);
+                        } else if ((count % 200) == 0) {
+                            mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
+                                          dbg, count, now_sec() - t0);
+                        }
+                    }
+                }
+                LIBMTP_destroy_file_t(file);
+            }
+        }
+    }
+
+    if (ids) {
         free(ids);
-        if (!dir->children_loaded)
-            dir->children_loaded = 1;
-        fprintf(stderr, "[LOAD] \"%s\" Get_Children failed\n", dbg);
-        fflush(stderr);
-        return;
+        ids = NULL;
+    }
+
+    mtp_node_t *dir_target = dir;
+
+    if (async_ok) {
+        pthread_mutex_lock(&g_lock);
+        tree_async_end();
+        if (g_tree_async_closing) {
+            free_built_child_chain(built);
+            goto load_done;
+        }
+        dir_target = node_find_dir_by_key(g_root, dir_key_sid, dir_key_oid);
+        if (!dir_target || dir_target->load_gen != gen_start || dir_target->children_loaded) {
+            free_built_child_chain(built);
+            goto load_done;
+        }
+    }
+
+    if (nkids < 0) {
+        if (!dir_target->children_loaded)
+            dir_target->children_loaded = 1;
+        free_built_child_chain(built);
+        if (trace) {
+            fprintf(stderr, "[LOAD] \"%s\" Get_Children failed\n", dbg);
+            fflush(stderr);
+        }
+        goto load_done;
     }
 
     if (nkids == 0) {
 #if defined(__APPLE__)
-        if (dir->parent == g_root)
-            mtp_synth_attach_volume_meta(dir);
+        if (dir_target->parent == g_root)
+            mtp_synth_attach_volume_meta(dir_target);
 #endif
-        if (!dir->children_loaded)
-            dir->children_loaded = 1;
+        if (!dir_target->children_loaded)
+            dir_target->children_loaded = 1;
+        free_built_child_chain(built);
         mtp_debug_log("[LOAD] \"%s\" empty folder (0 handles)", dbg);
-        fprintf(stderr, "[LOAD] \"%s\" done: 0 entries\n", dbg);
-        fflush(stderr);
-        return;
+        if (trace) {
+            fprintf(stderr, "[LOAD] \"%s\" done: 0 entries\n", dbg);
+            fflush(stderr);
+        }
+        goto load_done;
     }
 
-    int count = 0;
-    for (int i = 0; i < nkids; i++) {
-        pthread_mutex_lock(&g_mtp);
-        if (!g_device) {
-            pthread_mutex_unlock(&g_mtp);
-            free(ids);
-            if (!dir->children_loaded)
-                dir->children_loaded = 1;
-            mtp_debug_log("[LOAD] \"%s\" aborted mid-list (device gone)", dbg);
-            return;
-        }
-        LIBMTP_file_t *file = LIBMTP_Get_Filemetadata(g_device, ids[i]);
-        pthread_mutex_unlock(&g_mtp);
-
-        if (dir->children_loaded) {
-            if (file)
-                LIBMTP_destroy_file_t(file);
-            free(ids);
-            mtp_debug_log("[LOAD] \"%s\" superseded after %d/%d metadata fetches",
-                          dbg, i, nkids);
-            return;
-        }
-        if (file) {
-            int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
-            if (file->filename && file->filename[0] &&
-                !(mtp_skip_hidden_dot_filenames() && file->filename[0] == '.') &&
-                !node_find_child(dir, file->filename)) {
-                mtp_node_t *n = node_new(file->filename, is_dir,
-                                         file->item_id, file->storage_id);
-                if (n) {
-                    n->size  = file->filesize;
-                    n->mtime = file->modificationdate;
-                    node_add_child(dir, n);
-                    count++;
-                    if ((count % 200) == 0) {
-                        mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
-                                      dbg, count, now_sec() - t0);
-                        fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
-                        fflush(stderr);
-                    }
-                }
-            }
-            LIBMTP_destroy_file_t(file);
-        }
+    if (meta_aborted) {
+        free_built_child_chain(built);
+        if (!dir_target->children_loaded)
+            dir_target->children_loaded = 1;
+        mtp_debug_log("[LOAD] \"%s\" aborted mid-list (device gone)", dbg);
+        goto load_done;
     }
 
-    free(ids);
+    while (built) {
+        mtp_node_t *n = built;
+        built = n->next_sibling;
+        n->next_sibling = NULL;
+        if (n->name && !node_find_child(dir_target, n->name))
+            node_add_child(dir_target, n);
+        else
+            node_free(n);
+    }
 
 #if defined(__APPLE__)
-    if (dir->parent == g_root)
-        mtp_synth_attach_volume_meta(dir);
+    if (dir_target->parent == g_root)
+        mtp_synth_attach_volume_meta(dir_target);
 #endif
-    if (!dir->children_loaded)
-        dir->children_loaded = 1;
+    if (!dir_target->children_loaded)
+        dir_target->children_loaded = 1;
 
     mtp_debug_log("[LOAD] \"%s\" done: %d entries in %.3fs", dbg, count, now_sec() - t0);
-    fprintf(stderr, "[LOAD] \"%s\" done: %d entries in %.3fs\n",
-            dbg, count, now_sec() - t0);
-    fflush(stderr);
+    if (trace) {
+        fprintf(stderr, "[LOAD] \"%s\" done: %d entries in %.3fs\n",
+                dbg, count, now_sec() - t0);
+        fflush(stderr);
+    }
+
+load_done:
+    dir->load_busy = 0;
+    pthread_cond_broadcast(&g_dir_load_cv);
 }
 
 #if defined(__APPLE__)
@@ -896,6 +1191,10 @@ int mtp_open(void)
 #if defined(__APPLE__)
         mtp_cache_volume_icon_path_from_env();
 #endif
+        pthread_mutex_lock(&g_tree_async_mu);
+        g_tree_async_closing = 0;
+        g_tree_async_pause = 0;
+        pthread_mutex_unlock(&g_tree_async_mu);
         return 0;
     }
     return -1;
@@ -953,15 +1252,38 @@ static const char *mtp_path_for_tree(const char *path, char *norm_buf, size_t no
     return mtp_normalize_path_for_tree(path, norm_buf, norm_sz);
 }
 
+void mtp_invalidate_fuse_dir_cache(const char *fuse_path)
+{
+    if (!fuse_path || fuse_path[0] != '/')
+        return;
+    char norm[PATH_MAX];
+    const char *p = mtp_path_for_tree(fuse_path, norm, sizeof norm);
+    if (!p || p[0] != '/')
+        return;
+    pthread_mutex_lock(&g_lock);
+    mtp_node_t *n = resolve(p);
+    if (n && n->is_dir)
+        dir_drop_children_locked(n);
+    pthread_mutex_unlock(&g_lock);
+}
+
 void mtp_close(void)
 {
     mtp_debug_log("mtp_close: begin (release tree + device)");
+    pthread_mutex_lock(&g_tree_async_mu);
+    g_tree_async_closing = 1;
+    g_tree_async_pause = 1;
+    while (g_tree_async_inflight > 0)
+        pthread_cond_wait(&g_tree_async_cv, &g_tree_async_mu);
+    pthread_mutex_unlock(&g_tree_async_mu);
+
     pthread_mutex_lock(&g_lock);
 #if defined(__APPLE__)
     g_volicon_src[0] = '\0';
     mtp_synth_free_user_branches();
 #endif
     pthread_mutex_lock(&g_mtp);
+    storage_cache_invalidate_unlocked();
     if (g_root)   { node_free(g_root); g_root = NULL; }
     if (g_device) { LIBMTP_Release_Device(g_device); g_device = NULL; }
     g_cap_partial_get = -1;
@@ -969,11 +1291,21 @@ void mtp_close(void)
     pthread_mutex_unlock(&g_lock);
     free(g_fuse_mount_host_abs);
     g_fuse_mount_host_abs = NULL;
+    pthread_mutex_lock(&g_tree_async_mu);
+    g_tree_async_closing = 0;
+    g_tree_async_pause = 0;
+    pthread_mutex_unlock(&g_tree_async_mu);
     mtp_debug_shutdown();
 }
 
 int mtp_refresh_tree(void)
 {
+    pthread_mutex_lock(&g_tree_async_mu);
+    g_tree_async_pause = 1;
+    while (g_tree_async_inflight > 0)
+        pthread_cond_wait(&g_tree_async_cv, &g_tree_async_mu);
+    pthread_mutex_unlock(&g_tree_async_mu);
+
     pthread_mutex_lock(&g_lock);
 #if defined(__APPLE__)
     mtp_synth_free_user_branches();
@@ -982,6 +1314,13 @@ int mtp_refresh_tree(void)
     g_root = node_new("", 1, 0, 0);
     int ok = g_root != NULL;
     pthread_mutex_unlock(&g_lock);
+
+    pthread_mutex_lock(&g_tree_async_mu);
+    g_tree_async_pause = 0;
+    pthread_cond_broadcast(&g_tree_async_cv);
+    pthread_mutex_unlock(&g_tree_async_mu);
+
+    mtp_storage_cache_bust();
     if (!ok)
         mtp_debug_log("mtp_refresh_tree: node_new failed");
     return ok ? 0 : -ENOMEM;
@@ -1023,20 +1362,23 @@ int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t
         pthread_mutex_unlock(&g_mtp);
         return have_node ? -ENODEV : -ENOENT;
     }
-    LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
+    if (storage_cache_ensure_fresh_unlocked() != 0) {
+        pthread_mutex_unlock(&g_mtp);
+        return have_node ? -ENODEV : -ENOENT;
+    }
 
     uint64_t tot = 0, fr = 0;
     if (want_sid == 0u) {
-        for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
-            tot += s->MaxCapacity;
-            fr += s->FreeSpaceInBytes;
+        for (size_t i = 0; i < g_st_cache_n; i++) {
+            tot += g_st_cache[i].max_cap;
+            fr += g_st_cache[i].free_bytes;
         }
     } else {
         int found = 0;
-        for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
-            if (s->id == want_sid) {
-                tot = s->MaxCapacity;
-                fr = s->FreeSpaceInBytes;
+        for (size_t i = 0; i < g_st_cache_n; i++) {
+            if (g_st_cache[i].id == want_sid) {
+                tot = g_st_cache[i].max_cap;
+                fr = g_st_cache[i].free_bytes;
                 found = 1;
                 break;
             }
@@ -1086,6 +1428,7 @@ void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx),
         return;
     pthread_mutex_lock(&g_lock);
     if (g_root) {
+        load_children(g_root);
         for (mtp_node_t *c = g_root->first_child; c; c = c->next_sibling) {
             if (!c->is_dir || !c->name || !c->name[0] || c->is_synth)
                 continue;
@@ -1098,7 +1441,7 @@ void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx),
     pthread_mutex_unlock(&g_lock);
 }
 
-int mtp_stat(const char *path, mtp_stat_t *out)
+static int mtp_stat_impl(const char *path, mtp_stat_t *out, int force_meta_refresh)
 {
     if (!out) return -EINVAL;
     double t0 = now_sec();
@@ -1108,7 +1451,28 @@ int mtp_stat(const char *path, mtp_stat_t *out)
     mtp_node_t *n = resolve(path_use);
     int rc = -ENOENT;
     if (n) {
-        node_refresh_meta_if_stale_locked(n);
+        int is_real_file = (!n->is_synth && !n->is_dir && n->object_id != 0u);
+        int need_meta = 0;
+        if (is_real_file) {
+            if (force_meta_refresh)
+                need_meta = 1;
+            else {
+                double ttl = stat_meta_ttl_sec();
+                need_meta = (ttl <= 0.0) || (n->meta_cached_at <= 0.0) ||
+                            ((now_sec() - n->meta_cached_at) >= ttl);
+            }
+        }
+        if (need_meta) {
+            pthread_mutex_unlock(&g_lock);
+            if (refresh_file_meta_for_path(path_use) != 0)
+                return -EIO;
+            pthread_mutex_lock(&g_lock);
+            n = resolve(path_use);
+            if (!n) {
+                pthread_mutex_unlock(&g_lock);
+                return -ENOENT;
+            }
+        }
         out->is_dir     = n->is_dir;
         out->size       = n->size;
         out->mtime      = n->mtime;
@@ -1144,6 +1508,16 @@ int mtp_stat(const char *path, mtp_stat_t *out)
     return rc;
 }
 
+int mtp_stat(const char *path, mtp_stat_t *out)
+{
+    return mtp_stat_impl(path, out, 0);
+}
+
+int mtp_stat_refresh(const char *path, mtp_stat_t *out)
+{
+    return mtp_stat_impl(path, out, 1);
+}
+
 void mtp_readdir_snapshot_free(mtp_dirent_t *entries, size_t n)
 {
     if (!entries) return;
@@ -1174,9 +1548,9 @@ int mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out)
         mtp_debug_log("readdir_snapshot ENOTDIR path=%s (%.3fs)", path, now_sec() - t_snap);
         return -ENOTDIR;
     }
-    /* Refetch from device: cache was authoritative until the phone changed something. */
-    dir_drop_children_locked(n);
-    mtp_debug_log("readdir_snapshot load_children path=%s (fresh MTP listing)", path);
+    /* Use cached tree; refetch only if never loaded or after mtp_invalidate_fuse_dir_cache /
+     * upload invalidation / periodic volume drop (fs_ops). */
+    mtp_debug_log("readdir_snapshot load_children path=%s", path);
     load_children(n);
 
     size_t count = 0;
@@ -1234,6 +1608,52 @@ int mtp_supports_partial_read(void)
     pthread_mutex_unlock(&g_mtp);
     mtp_debug_log("mtp_supports_partial_read: %d", g_cap_partial_get);
     return g_cap_partial_get;
+}
+
+/* Walk forward with GetPartialObject from [known_min] until no more bytes.
+ * ObjectCompressedSize often under-reports MP4/MOV; without this, Finder copies stop short
+ * (e.g. 69 MiB of 74 MiB) and sit in "copying" forever. */
+static uint64_t mtp_discover_object_eof_via_partial(uint32_t oid, uint64_t known_min)
+{
+    if (oid == 0u)
+        return known_min;
+    const uint32_t chunk = 2097152u;
+    uint64_t hi = known_min;
+
+    for (;;) {
+        unsigned char *data = NULL;
+        unsigned int got = 0;
+        int chunk_ok = 0;
+        for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+            if (k > 0)
+                mtp_usb_backoff((unsigned)k);
+            pthread_mutex_lock(&g_mtp);
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                return known_min;
+            }
+            int last = LIBMTP_GetPartialObject(g_device, oid, hi, chunk, &data, &got);
+            pthread_mutex_unlock(&g_mtp);
+            if (last == 0 && data && got > 0u) {
+                if (got > chunk)
+                    got = chunk;
+                chunk_ok = 1;
+                break;
+            }
+            if (data) {
+                free(data);
+                data = NULL;
+            }
+            log_mtp_errors();
+        }
+        if (!chunk_ok)
+            break;
+        hi += (uint64_t)got;
+        free(data);
+        if (got < chunk)
+            break;
+    }
+    return hi;
 }
 
 int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
@@ -1317,11 +1737,36 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
         return mtp_volicon_pread(buf, size, offset);
     }
 #endif
+    pthread_mutex_unlock(&g_lock);
+    if (refresh_file_meta_for_path(path_use) != 0)
+        return -EIO;
+    pthread_mutex_lock(&g_lock);
+    n = resolve(path_use);
+    if (!n)        { pthread_mutex_unlock(&g_lock); return -ENOENT; }
+    if (n->is_dir) { pthread_mutex_unlock(&g_lock); return -EISDIR; }
     uint32_t oid = n->object_id;
     uint64_t total = n->size;
     pthread_mutex_unlock(&g_lock);
 
-    if ((uint64_t)offset >= total) return 0;
+    if ((uint64_t)offset >= total) {
+        if (!mtp_supports_partial_read())
+            return 0;
+        uint64_t ext = mtp_discover_object_eof_via_partial(oid, total);
+        if (ext > total) {
+            mtp_debug_log("mtp_read extend oid=%u metadata_sz=%llu discovered=%llu",
+                          oid, (unsigned long long)total, (unsigned long long)ext);
+            pthread_mutex_lock(&g_lock);
+            n = resolve(path_use);
+            if (n && n->object_id == oid && n->size < ext) {
+                n->size = ext;
+                n->meta_cached_at = now_sec();
+            }
+            total = ext;
+            pthread_mutex_unlock(&g_lock);
+        }
+        if ((uint64_t)offset >= total)
+            return 0;
+    }
     if (offset + size > total) size = (size_t)(total - offset);
 
     mtp_debug_log("mtp_read begin path=%s oid=%u off=%lld sz=%zu file_sz=%llu",
@@ -1335,10 +1780,9 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
     }
 
     /* No GetPartialObject: pull full file into a temp fd and pread(). */
-    char tmpl[] = "/tmp/mtpfuse_readXXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) return -errno;
-    unlink(tmpl);
+    int fd = mtp_anon_tempfile_fd("mtpfuse_read");
+    if (fd < 0)
+        return fd;
 
     int rc = mtp_get_oid_to_fd_full_retry(oid, fd, total);
     if (rc == -ENODEV) {
@@ -1395,8 +1839,20 @@ int mtp_download_to_fd(const char *path, int fd)
         return (cr == 0) ? 0 : cr;
     }
 #endif
+    pthread_mutex_unlock(&g_lock);
+    if (refresh_file_meta_for_path(path_use) != 0)
+        return -EIO;
+    pthread_mutex_lock(&g_lock);
+    n = resolve(path_use);
+    if (!n) {
+        pthread_mutex_unlock(&g_lock);
+        return -ENOENT;
+    }
+    if (n->is_dir) {
+        pthread_mutex_unlock(&g_lock);
+        return -EISDIR;
+    }
     uint32_t oid = n->object_id;
-    node_refresh_meta_if_stale_locked(n);
     uint64_t expect = n->size;
     pthread_mutex_unlock(&g_lock);
 
@@ -1447,6 +1903,30 @@ static void tree_detach(mtp_node_t *n)
         n->next_sibling = NULL;
         n->parent = NULL;
     }
+}
+
+/* After upload: update one dentry in an already-loaded folder. Avoids nuking every
+ * sibling (Finder re-stat storms + FUSE freezes on large DCIM folders). */
+static void tree_upsert_uploaded_file_locked(mtp_node_t *parent, const char *basename,
+                                               uint32_t new_oid, uint32_t stor_id,
+                                               uint64_t file_size)
+{
+    if (!parent || !parent->is_dir || !basename || !basename[0] || new_oid == 0u)
+        return;
+    if (!parent->children_loaded)
+        return;
+    mtp_node_t *old = node_find_child(parent, basename);
+    if (old) {
+        tree_detach(old);
+        node_free(old);
+    }
+    mtp_node_t *nn = node_new(basename, 0, new_oid, stor_id);
+    if (!nn)
+        return;
+    nn->size = file_size;
+    nn->mtime = (uint64_t)time(NULL);
+    nn->meta_cached_at = now_sec();
+    node_add_child(parent, nn);
 }
 
 /* UNKNOWN works on many phones; explicit MP4 type has triggered bad objects on some stacks. */
@@ -1604,7 +2084,6 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     uint64_t reclaim_replace = 0;
     if (existing && !existing->is_dir) {
         replace_oid = existing->object_id;
-        node_refresh_meta_if_stale_locked(existing);
         reclaim_replace = existing->size;
         mtp_debug_log("mtp_write_send_fd: replacing existing file object_id=%u", replace_oid);
     }
@@ -1631,8 +2110,8 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
             free(path_dup);
             return -EIO;
         }
-        /* Brief settle; long sleeps kept Finder at “Preparing” with no byte progress. */
-        usleep(50000);
+        /* Short settle after delete; keep minimal to reduce “done copying” lag. */
+        usleep(10000);
     }
 
     /* Ensure fd is at offset 0 with pending writes flushed. */
@@ -1702,6 +2181,8 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
 
         int verify_ok = 1;
         uint32_t new_oid = meta->item_id;
+        uint64_t post_meta_sz = 0;
+        int have_post_meta = 0;
         if (new_oid != 0u) {
             pthread_mutex_lock(&g_mtp);
             LIBMTP_file_t *chk = g_device ? LIBMTP_Get_Filemetadata(g_device, new_oid) : NULL;
@@ -1711,14 +2192,15 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
                               new_oid, wave);
                 mtp_delete_object_retry(new_oid);
                 verify_ok = 0;
-            } else if ((uint64_t)chk->filesize != (uint64_t)size) {
-                mtp_debug_log("mtp_write_send_fd: post-send SIZE oid=%u device=%llu sent=%zu wave=%u",
-                              new_oid, (unsigned long long)chk->filesize, size, wave);
-                LIBMTP_destroy_file_t(chk);
-                mtp_delete_object_retry(new_oid);
-                verify_ok = 0;
             } else {
+                post_meta_sz = (uint64_t)chk->filesize;
+                have_post_meta = 1;
                 LIBMTP_destroy_file_t(chk);
+                /* With GetPartialObject we verify bytes; metadata often lies on media. */
+                if (mtp_supports_partial_read() && post_meta_sz < (uint64_t)size)
+                    mtp_debug_log("mtp_write_send_fd: post-send metadata size %llu < sent %zu "
+                                  "(common on media; byte verify next)",
+                                  (unsigned long long)post_meta_sz, size);
             }
         } else {
             mtp_debug_log("mtp_write_send_fd: post-send verify skipped (item_id==0)");
@@ -1726,6 +2208,13 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
 
         if (verify_ok && new_oid != 0u && size > 0u && mtp_supports_partial_read()) {
             if (mtp_verify_upload_head_tail_vs_fd(new_oid, fd, size) != 0) {
+                mtp_delete_object_retry(new_oid);
+                verify_ok = 0;
+            }
+        } else if (verify_ok && new_oid != 0u && size > 0u && !mtp_supports_partial_read()) {
+            if (!have_post_meta || post_meta_sz < (uint64_t)size) {
+                mtp_debug_log("mtp_write_send_fd: no partial read; metadata %llu vs sent %zu — reject",
+                              (unsigned long long)post_meta_sz, size);
                 mtp_delete_object_retry(new_oid);
                 verify_ok = 0;
             }
@@ -1738,19 +2227,16 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
 
         pthread_mutex_lock(&g_lock);
         mtp_node_t *parent_now = resolve(parent_path);
-        if (parent_now && parent_now->children_loaded) {
-            mtp_node_t *child = parent_now->first_child;
-            parent_now->first_child = NULL;
-            while (child) {
-                mtp_node_t *next = child->next_sibling;
-                node_free(child);
-                child = next;
-            }
-            parent_now->children_loaded = 0;
-            mtp_debug_log("mtp_write_send_fd: invalidated parent child cache");
+        if (parent_now && new_oid != 0u) {
+            uint32_t sid_use = node_effective_storage_id(parent_now);
+            if (sid_use == 0u)
+                sid_use = storage_id;
+            tree_upsert_uploaded_file_locked(parent_now, basename, new_oid, sid_use,
+                                             (uint64_t)size);
         }
         pthread_mutex_unlock(&g_lock);
 
+        mtp_storage_cache_bust();
         free(path_dup);
         mtp_debug_log("mtp_write_send_fd: success");
         return 0;
@@ -1769,10 +2255,9 @@ int mtp_write_full_fd(const char *path, int fd, size_t size)
 
 int mtp_write_full(const char *path, const char *buf, size_t size)
 {
-    char tmpl[] = "/tmp/mtpfuse_wrXXXXXX";
-    int fd = mkstemp(tmpl);
-    if (fd < 0) return -errno;
-    unlink(tmpl);
+    int fd = mtp_anon_tempfile_fd("mtpfuse_wr");
+    if (fd < 0)
+        return fd;
     ssize_t off = 0;
     while ((size_t)off < size) {
         ssize_t w = write(fd, buf + off, size - off);
@@ -2029,7 +2514,15 @@ int mtp_rename(const char *from, const char *to)
         src->storage_id = new_storage_id;
         node_add_child(dp, src);
     }
+    int do_meta = !src->is_dir;
+    uint32_t oid_after = src->object_id;
     pthread_mutex_unlock(&g_lock);
+    if (do_meta)
+        refresh_meta_by_oid_for_tree(oid_after);
+
+    mtp_invalidate_fuse_dir_cache(fparent_s);
+    if (strcmp(fparent_s, tparent_s) != 0)
+        mtp_invalidate_fuse_dir_cache(tparent_s);
 
     free(fpath);
     free(tpath);
