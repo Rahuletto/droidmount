@@ -198,7 +198,8 @@ final class MountManager {
         var st = statfs()
         guard statfs(path, &st) == 0 else { return false }
         let fstype = withUnsafeBytes(of: &st.f_fstypename) { raw -> String in
-            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+            guard let base = raw.baseAddress else { return "" }
+            return String(cString: base.assumingMemoryBound(to: CChar.self))
         }
         return fstype.contains("fuse") || fstype.contains("macfuse")
     }

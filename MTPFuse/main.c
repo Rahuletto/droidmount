@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Best-effort teardown: mtp_close is not fully async-signal-safe, but avoids
+ * leaving the MTP stack up after SIGTERM. Prefer exiting via unmount when possible. */
 static void on_signal(int sig)
 {
     fprintf(stderr, "mtpfuse: signal %d, shutting down\n", sig);

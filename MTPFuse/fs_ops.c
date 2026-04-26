@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -28,6 +29,7 @@
  * touching them during folder browse won't pull gigabytes up front. */
 #define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)64 * 1024 * 1024)
 
+/* Serializes lazy mtp_download_to_fd for one handle; never nest with g_lock. */
 static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static double fuse_mono_ms(void)
@@ -35,6 +37,78 @@ static double fuse_mono_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/* Stable inode: real MTP handles, synthetic bit for storage volume nodes. */
+static ino_t mtp_stat_ino(const mtp_stat_t *s)
+{
+    if (s->object_id)
+        return (ino_t)s->object_id;
+    if (s->storage_id)
+        return (ino_t)(0xC000000000000000ULL | (uint64_t)s->storage_id);
+    return 1;
+}
+
+/* Fill struct stat from bridge metadata (used by getattr and readdir). */
+static void mtp_fill_stat(const mtp_stat_t *s, struct stat *st)
+{
+    memset(st, 0, sizeof(*st));
+    if (s->is_dir) {
+        st->st_mode  = S_IFDIR | 0755;
+        st->st_nlink = 2;
+    } else {
+        st->st_mode  = S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size  = (off_t)s->size;
+        if (s->size)
+            st->st_blocks = (blkcnt_t)((s->size + 511) / 512);
+    }
+    st->st_uid = getuid();
+    st->st_gid = getgid();
+    st->st_ino = mtp_stat_ino(s);
+
+    time_t mt = (time_t)s->mtime;
+    if (mt == 0 && s->is_dir)
+        mt = time(NULL);
+
+    st->st_mtime = mt;
+    st->st_atime = mt;
+    st->st_ctime = mt;
+#if defined(__APPLE__)
+    /* LIBMTP_file_t only has modificationdate; use it for birthtime too. */
+    st->st_birthtime = mt;
+#endif
+}
+
+static void parent_path_for_readdir(const char *path, char *out, size_t cap)
+{
+    if (!path || path[0] != '/' || cap < 2) {
+        if (cap) out[0] = '\0';
+        return;
+    }
+    if (path[1] == '\0') {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+    const char *slash = strrchr(path + 1, '/');
+    if (!slash) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+    if (slash == path + 1) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+    size_t n = (size_t)(slash - path);
+    if (n + 1 > cap) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(out, path, n);
+    out[n] = '\0';
 }
 
 typedef struct {
@@ -49,27 +123,12 @@ static int op_getattr(const char *path, struct stat *st)
 {
     static unsigned long getattr_seq;
     double t0 = fuse_mono_ms();
-    memset(st, 0, sizeof(*st));
     mtp_stat_t s;
     int rc = mtp_stat(path, &s);
     mtp_debug_log("fuse getattr #%lu path=%s mtp_rc=%d %.2fms",
                   ++getattr_seq, path, rc, fuse_mono_ms() - t0);
     if (rc != 0) return rc;
-    if (s.is_dir) {
-        st->st_mode  = S_IFDIR | 0755;
-        st->st_nlink = 2;
-    } else {
-        st->st_mode  = S_IFREG | 0644;
-        st->st_nlink = 1;
-        st->st_size  = (off_t)s.size;
-    }
-    st->st_uid = getuid();
-    st->st_gid = getgid();
-    if (s.mtime) {
-        st->st_mtime = (time_t)s.mtime;
-        st->st_atime = (time_t)s.mtime;
-        st->st_ctime = (time_t)s.mtime;
-    }
+    mtp_fill_stat(&s, st);
     return 0;
 }
 
@@ -94,14 +153,33 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         return rc;
     }
 
-    struct stat st_dir;
-    memset(&st_dir, 0, sizeof(st_dir));
-    st_dir.st_mode = S_IFDIR | 0755;
+    mtp_stat_t s_here;
+    struct stat st_dot;
+    if (mtp_stat(path, &s_here) != 0) {
+        memset(&s_here, 0, sizeof(s_here));
+        s_here.is_dir = 1;
+    }
+    mtp_fill_stat(&s_here, &st_dot);
+
+    char parent[PATH_MAX];
+    parent_path_for_readdir(path, parent, sizeof(parent));
+    mtp_stat_t s_up;
+    struct stat st_dotdot;
+    if (parent[0] && mtp_stat(parent, &s_up) == 0)
+        mtp_fill_stat(&s_up, &st_dotdot);
+    else {
+        memset(&st_dotdot, 0, sizeof(st_dotdot));
+        st_dotdot.st_mode  = S_IFDIR | 0755;
+        st_dotdot.st_nlink = 2;
+        st_dotdot.st_uid   = getuid();
+        st_dotdot.st_gid   = getgid();
+        st_dotdot.st_ino   = 1;
+    }
 
     int buf_full = 0;
     off_t cookie = 1;
     if (cookie > off) {
-        if (filler(buf, ".", &st_dir, cookie)) {
+        if (filler(buf, ".", &st_dot, cookie)) {
             buf_full = 1;
             goto out;
         }
@@ -109,7 +187,7 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     cookie++;
 
     if (cookie > off) {
-        if (filler(buf, "..", &st_dir, cookie)) {
+        if (filler(buf, "..", &st_dotdot, cookie)) {
             buf_full = 1;
             goto out;
         }
@@ -118,8 +196,14 @@ static int op_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     for (size_t i = 0; i < nent; i++) {
         struct stat st;
-        memset(&st, 0, sizeof(st));
-        st.st_mode = entries[i].is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+        mtp_stat_t se;
+        memset(&se, 0, sizeof(se));
+        se.is_dir     = entries[i].is_dir;
+        se.size       = entries[i].size;
+        se.mtime      = entries[i].mtime;
+        se.object_id  = entries[i].object_id;
+        se.storage_id = entries[i].storage_id;
+        mtp_fill_stat(&se, &st);
         if (cookie > off) {
             if (filler(buf, entries[i].name, &st, cookie)) {
                 buf_full = 1;

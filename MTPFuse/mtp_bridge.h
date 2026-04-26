@@ -28,6 +28,8 @@ typedef struct {
     int      is_dir;
     uint64_t size;
     uint64_t mtime;
+    uint32_t object_id;   /* 0 = synthetic storage volume node */
+    uint32_t storage_id;
 } mtp_stat_t;
 
 int  mtp_stat(const char *path, mtp_stat_t *out);
@@ -35,8 +37,12 @@ int  mtp_stat(const char *path, mtp_stat_t *out);
 /* One directory level from cache (after MTP fetch for that folder only).
  * Snapshot is malloc'd; free with mtp_readdir_snapshot_free. */
 typedef struct {
-    char *name;
-    int   is_dir;
+    char    *name;
+    int      is_dir;
+    uint64_t size;
+    uint64_t mtime;
+    uint32_t object_id;
+    uint32_t storage_id;
 } mtp_dirent_t;
 
 int  mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out);

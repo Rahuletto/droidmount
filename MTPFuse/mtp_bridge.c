@@ -7,6 +7,15 @@
  * Loading is lazy and one MTP level at a time (BFS-by-navigation):
  * resolve() walks path components and calls load_children() only on
  * each ancestor — never recursively prefetches deeper folders.
+ *
+ * Locking (deadlock avoidance):
+ *   • g_lock  — in-memory tree; callers hold it across resolve/load_children.
+ *   • g_mtp   — all libmtp USB I/O; take only while NOT holding g_mtp then
+ *               waiting for g_lock. load_children: g_lock → g_mtp (release
+ *               g_mtp before returning; never block on g_lock while holding g_mtp).
+ *   • mtp_close: g_lock then g_mtp (same as other “full session” teardown).
+ * FUSE fs_ops.c uses g_stage_mu only around lazy download; order there is
+ * g_stage_mu → (bridge takes g_lock → g_mtp inside mtp_download_to_fd).
  */
 
 #define _DARWIN_C_SOURCE 1
@@ -49,6 +58,27 @@ static pthread_mutex_t     g_lock   = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t     g_mtp    = PTHREAD_MUTEX_INITIALIZER;
 
 static void log_mtp_errors(void);
+
+/* Refresh size + modification time from the device when the directory
+ * listing left them unset (common for some stacks). Caller must hold g_lock;
+ * briefly takes g_mtp (same nesting order as load_children). */
+static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
+{
+    if (!n || n->object_id == 0 || n->mtime != 0)
+        return;
+    pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        return;
+    }
+    LIBMTP_file_t *f = LIBMTP_Get_Filemetadata(g_device, n->object_id);
+    pthread_mutex_unlock(&g_mtp);
+    if (!f)
+        return;
+    n->size  = f->filesize;
+    n->mtime = (uint64_t)f->modificationdate;
+    LIBMTP_destroy_file_t(f);
+}
 
 /* ---------- helpers ---------- */
 
@@ -124,6 +154,10 @@ static void load_children(mtp_node_t *dir)
         mtp_debug_log("[LOAD] root start");
         fprintf(stderr, "[LOAD] root start\n");
         fflush(stderr);
+        if (!g_device) {
+            dir->children_loaded = 1;
+            return;
+        }
         for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
             const char *nm = s->StorageDescription
                                 ? s->StorageDescription : "Storage";
@@ -149,6 +183,12 @@ static void load_children(mtp_node_t *dir)
     fflush(stderr);
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        if (!dir->children_loaded)
+            dir->children_loaded = 1;
+        return;
+    }
     uint32_t *ids = NULL;
     int nkids = LIBMTP_Get_Children(g_device, sid, pid, &ids);
     pthread_mutex_unlock(&g_mtp);
@@ -179,6 +219,14 @@ static void load_children(mtp_node_t *dir)
     int count = 0;
     for (int i = 0; i < nkids; i++) {
         pthread_mutex_lock(&g_mtp);
+        if (!g_device) {
+            pthread_mutex_unlock(&g_mtp);
+            free(ids);
+            if (!dir->children_loaded)
+                dir->children_loaded = 1;
+            mtp_debug_log("[LOAD] \"%s\" aborted mid-list (device gone)", dbg);
+            return;
+        }
         LIBMTP_file_t *file = LIBMTP_Get_Filemetadata(g_device, ids[i]);
         pthread_mutex_unlock(&g_mtp);
 
@@ -250,6 +298,8 @@ static mtp_node_t *resolve(const char *path)
 
 static void log_mtp_errors(void)
 {
+    if (!g_device)
+        return;
     LIBMTP_Dump_Errorstack(g_device);
     LIBMTP_Clear_Errorstack(g_device);
 }
@@ -360,6 +410,13 @@ int mtp_open(void)
     fprintf(stderr, "mtp_open: ready\n"); fflush(stderr);
 
     g_root = node_new("", 1, 0, 0);
+    if (!g_root) {
+        mtp_debug_log("mtp_open: node_new(root) failed");
+        fprintf(stderr, "mtp_open: out of memory building root node\n");
+        LIBMTP_Release_Device(g_device);
+        g_device = NULL;
+        return -1;
+    }
     mtp_debug_log("mtp_open: success g_root=%p", (void *)g_root);
     return 0;
 }
@@ -381,8 +438,11 @@ int mtp_refresh_tree(void)
     pthread_mutex_lock(&g_lock);
     if (g_root) { node_free(g_root); g_root = NULL; }
     g_root = node_new("", 1, 0, 0);
+    int ok = g_root != NULL;
     pthread_mutex_unlock(&g_lock);
-    return g_root ? 0 : -1;
+    if (!ok)
+        mtp_debug_log("mtp_refresh_tree: node_new failed");
+    return ok ? 0 : -ENOMEM;
 }
 
 int mtp_stat(const char *path, mtp_stat_t *out)
@@ -393,9 +453,12 @@ int mtp_stat(const char *path, mtp_stat_t *out)
     mtp_node_t *n = resolve(path);
     int rc = -ENOENT;
     if (n) {
-        out->is_dir = n->is_dir;
-        out->size   = n->size;
-        out->mtime  = n->mtime;
+        node_refresh_meta_if_stale_locked(n);
+        out->is_dir    = n->is_dir;
+        out->size      = n->size;
+        out->mtime     = n->mtime;
+        out->object_id = n->object_id;
+        out->storage_id = n->storage_id;
         rc = 0;
     }
     pthread_mutex_unlock(&g_lock);
@@ -453,8 +516,13 @@ int mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out)
 
     size_t i = 0;
     for (mtp_node_t *c = n->first_child; c; c = c->next_sibling) {
-        arr[i].name = strdup(c->name);
-        arr[i].is_dir = c->is_dir;
+        node_refresh_meta_if_stale_locked(c);
+        arr[i].name    = strdup(c->name);
+        arr[i].is_dir  = c->is_dir;
+        arr[i].size    = c->size;
+        arr[i].mtime   = c->mtime;
+        arr[i].object_id  = c->object_id;
+        arr[i].storage_id = c->storage_id;
         if (!arr[i].name) {
             mtp_readdir_snapshot_free(arr, i);
             pthread_mutex_unlock(&g_lock);
@@ -501,6 +569,11 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
     unlink(tmpl);
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        close(fd);
+        return -ENODEV;
+    }
     int rc = LIBMTP_Get_File_To_File_Descriptor(
         g_device, oid, fd, NULL, NULL);
     if (rc != 0) log_mtp_errors();
@@ -543,6 +616,10 @@ int mtp_download_to_fd(const char *path, int fd)
 
     mtp_debug_log("mtp_download_to_fd path=%s oid=%u", path, oid);
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        return -ENODEV;
+    }
     int rc = LIBMTP_Get_File_To_File_Descriptor(
         g_device, oid, fd, NULL, NULL);
     if (rc != 0)
@@ -618,6 +695,11 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
 
     if (replace_oid) {
         pthread_mutex_lock(&g_mtp);
+        if (!g_device) {
+            pthread_mutex_unlock(&g_mtp);
+            free(dup);
+            return -ENODEV;
+        }
         LIBMTP_Delete_Object(g_device, replace_oid);
         pthread_mutex_unlock(&g_mtp);
     }
@@ -635,6 +717,12 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
     meta->filetype   = LIBMTP_FILETYPE_UNKNOWN;
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        LIBMTP_destroy_file_t(meta);
+        free(dup);
+        return -ENODEV;
+    }
     int rc = LIBMTP_Send_File_From_File_Descriptor(
         g_device, fd, meta, NULL, NULL);
     if (rc != 0) log_mtp_errors();
@@ -749,6 +837,16 @@ int mtp_rename(const char *from, const char *to)
 
     if (orphan_target) {
         pthread_mutex_lock(&g_mtp);
+        if (!g_device) {
+            pthread_mutex_unlock(&g_mtp);
+            pthread_mutex_lock(&g_lock);
+            node_free(orphan_target);
+            pthread_mutex_unlock(&g_lock);
+            free(fpath);
+            free(tpath);
+            mtp_refresh_tree();
+            return -ENODEV;
+        }
         int dr = LIBMTP_Delete_Object(g_device, orphan_target->object_id);
         if (dr != 0) log_mtp_errors();
         pthread_mutex_unlock(&g_mtp);
@@ -763,6 +861,13 @@ int mtp_rename(const char *from, const char *to)
     }
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        free(fpath);
+        free(tpath);
+        mtp_refresh_tree();
+        return -ENODEV;
+    }
     int rc;
     if (same_parent) {
         rc = LIBMTP_Set_Object_Filename(g_device, src_oid, (char *)tname);
@@ -832,6 +937,10 @@ int mtp_unlink(const char *path)
     pthread_mutex_unlock(&g_lock);
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        return -ENODEV;
+    }
     int rc = LIBMTP_Delete_Object(g_device, oid);
     if (rc != 0) log_mtp_errors();
     pthread_mutex_unlock(&g_mtp);
@@ -870,6 +979,11 @@ int mtp_mkdir(const char *path)
     pthread_mutex_unlock(&g_lock);
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        free(dup);
+        return -ENODEV;
+    }
     uint32_t new_id = LIBMTP_Create_Folder(g_device, name, parent_id, storage_id);
     if (new_id == 0) log_mtp_errors();
     pthread_mutex_unlock(&g_mtp);
@@ -900,6 +1014,10 @@ int mtp_rmdir(const char *path)
     pthread_mutex_unlock(&g_lock);
 
     pthread_mutex_lock(&g_mtp);
+    if (!g_device) {
+        pthread_mutex_unlock(&g_mtp);
+        return -ENODEV;
+    }
     int rc = LIBMTP_Delete_Object(g_device, oid);
     if (rc != 0) log_mtp_errors();
     pthread_mutex_unlock(&g_mtp);

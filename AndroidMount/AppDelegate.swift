@@ -2,23 +2,31 @@ import Cocoa
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var usbWatcher: USBWatcher!
-    private var mountManager: MountManager!
+    private var usbWatcher: USBWatcher?
+    private var mountManager: MountManager?
 
     /// USB location → device info while connected (may mount async).
     private var knownDevices: [UInt32: USBDevice] = [:]
+    /// Location IDs currently waiting on `MountManager.mount` (USB auto or menu “Mount”).
+    private var mountingDevices: Set<UInt32> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
             if let img = NSImage(systemSymbolName: "iphone",
                                  accessibilityDescription: "AndroidMount") {
-                img.isTemplate = true
-                btn.image = img
+                let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+                btn.image = img.withSymbolConfiguration(cfg)
+                btn.image?.isTemplate = true
             } else {
                 btn.title = "Phone"
             }
             if btn.image == nil { btn.title = "Phone" }
+        }
+
+        mountManager = MountManager()
+        usbWatcher = USBWatcher { [weak self] event in
+            DispatchQueue.main.async { self?.handleUSB(event) }
         }
         rebuildMenu()
 
@@ -27,11 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showMacFuseAlert()
         }
 
-        mountManager = MountManager()
-        usbWatcher = USBWatcher { [weak self] event in
-            DispatchQueue.main.async { self?.handleUSB(event) }
-        }
-        usbWatcher.start()
+        usbWatcher?.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -43,10 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch event {
         case .connected(let dev):
             knownDevices[dev.locationID] = dev
+            mountingDevices.insert(dev.locationID)
             rebuildMenu()
-            mountManager.mount(device: dev) { [weak self] result in
+            mountManager?.mount(device: dev) { [weak self] result in
                 DispatchQueue.main.async {
                     guard let self = self else { return }
+                    self.mountingDevices.remove(dev.locationID)
                     switch result {
                     case .success:
                         self.rebuildMenu()
@@ -58,13 +64,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .disconnected(let dev):
             knownDevices.removeValue(forKey: dev.locationID)
-            mountManager.unmount(locationID: dev.locationID)
+            mountManager?.unmount(locationID: dev.locationID)
             rebuildMenu()
         }
     }
 
     private func rebuildMenu(error: String? = nil, for failed: USBDevice? = nil) {
         let menu = NSMenu()
+        guard let mm = mountManager else {
+            menu.addItem(withTitle: "Starting…", action: nil, keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Quit AndroidMount", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            statusItem.menu = menu
+            return
+        }
 
         if let err = error, let dev = failed {
             menu.addItem(withTitle: "Error (\(dev.name)): \(err)", action: nil, keyEquivalent: "")
@@ -82,26 +95,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             header.isEnabled = false
             menu.addItem(header)
             for (loc, dev) in sortedDevs {
-                if let path = mountManager.mountPoint(for: loc) {
-                    let sub = NSMenu()
-                    let open = NSMenuItem(title: "Open in Finder", action: #selector(openMount(_:)), keyEquivalent: "o")
+                let sub = NSMenu()
+                let path = mm.mountPoint(for: loc)
+                let isMounting = mountingDevices.contains(loc)
+
+                if let mp = path {
+                    let open = NSMenuItem(title: "Show in Finder", action: #selector(openMount(_:)), keyEquivalent: "o")
                     open.target = self
-                    open.representedObject = path
+                    open.representedObject = mp
                     sub.addItem(open)
                     let ej = NSMenuItem(title: "Eject", action: #selector(ejectOne(_:)), keyEquivalent: "")
                     ej.target = self
                     ej.representedObject = NSNumber(value: loc)
                     sub.addItem(ej)
-                    let item = NSMenuItem(title: dev.name, action: nil, keyEquivalent: "")
-                    item.submenu = sub
-                    menu.addItem(item)
-                } else {
-                    let pending = NSMenuItem(title: "\(dev.name) — mounting…", action: nil, keyEquivalent: "")
+                } else if isMounting {
+                    let pending = NSMenuItem(title: "Mounting…", action: nil, keyEquivalent: "")
                     pending.isEnabled = false
-                    menu.addItem(pending)
+                    pending.image = Self.sfMenuIcon("arrow.triangle.2.circlepath")
+                    sub.addItem(pending)
+                } else {
+                    let mountItem = NSMenuItem(title: "Mount", action: #selector(mountOne(_:)), keyEquivalent: "")
+                    mountItem.target = self
+                    mountItem.representedObject = NSNumber(value: loc)
+                    mountItem.image = Self.sfMenuIcon("externaldrive.badge.plus")
+                    sub.addItem(mountItem)
                 }
+
+                let item = NSMenuItem(title: dev.name, action: nil, keyEquivalent: "")
+                item.submenu = sub
+                item.image = Self.sfMenuIcon("iphone")
+                menu.addItem(item)
             }
-            if sortedDevs.contains(where: { mountManager.mountPoint(for: $0.key) != nil }) {
+            if sortedDevs.contains(where: { mm.mountPoint(for: $0.key) != nil }) {
                 menu.addItem(.separator())
                 let ejectAll = NSMenuItem(title: "Eject all", action: #selector(ejectAll), keyEquivalent: "e")
                 ejectAll.target = self
@@ -123,16 +148,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func ejectOne(_ sender: NSMenuItem) {
         if let n = sender.representedObject as? NSNumber {
             let loc = n.uint32Value
-            knownDevices.removeValue(forKey: loc)
-            mountManager.unmount(locationID: loc)
+            mountManager?.unmount(locationID: loc)
             rebuildMenu()
         }
     }
 
     @objc private func ejectAll() {
-        knownDevices.removeAll()
-        mountManager.unmount()
+        mountManager?.unmount()
         rebuildMenu()
+    }
+
+    @objc private func mountOne(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? NSNumber else { return }
+        let loc = n.uint32Value
+        guard let dev = knownDevices[loc] else { return }
+        mountingDevices.insert(loc)
+        rebuildMenu()
+        mountManager?.mount(device: dev) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.mountingDevices.remove(loc)
+                switch result {
+                case .success:
+                    self.rebuildMenu()
+                case .failure(let err):
+                    self.rebuildMenu(error: err.localizedDescription, for: dev)
+                }
+            }
+        }
+    }
+
+    private static func sfMenuIcon(_ name: String) -> NSImage? {
+        guard let raw = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        let img = raw.withSymbolConfiguration(cfg) ?? raw
+        img.isTemplate = true
+        let s = NSSize(width: 16, height: 16)
+        img.size = s
+        return img
     }
 
     private func showMacFuseAlert() {
@@ -141,8 +194,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.informativeText = "AndroidMount needs macFUSE to mount Android devices as Finder volumes.\n\nInstall it from https://osxfuse.github.io and reboot."
         alert.addButton(withTitle: "Open Download Page")
         alert.addButton(withTitle: "Continue Anyway")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(string: "https://osxfuse.github.io")!)
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "https://osxfuse.github.io") {
+            NSWorkspace.shared.open(url)
         }
     }
 }

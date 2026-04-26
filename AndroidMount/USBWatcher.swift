@@ -101,7 +101,8 @@ final class USBWatcher {
             kIOMatchedNotification,
             matching,
             { ctx, iter in
-                let me = Unmanaged<USBWatcher>.fromOpaque(ctx!).takeUnretainedValue()
+                guard let ctx = ctx else { return }
+                let me = Unmanaged<USBWatcher>.fromOpaque(ctx).takeUnretainedValue()
                 me.drain(iter: iter, added: true)
             }, selfPtr, &addedIter)
         drain(iter: addedIter, added: true) // arm + emit existing
@@ -111,7 +112,8 @@ final class USBWatcher {
             kIOTerminatedNotification,
             matching2,
             { ctx, iter in
-                let me = Unmanaged<USBWatcher>.fromOpaque(ctx!).takeUnretainedValue()
+                guard let ctx = ctx else { return }
+                let me = Unmanaged<USBWatcher>.fromOpaque(ctx).takeUnretainedValue()
                 me.drain(iter: iter, added: false)
             }, selfPtr, &removedIter)
         drain(iter: removedIter, added: false)
