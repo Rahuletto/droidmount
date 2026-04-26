@@ -16,6 +16,11 @@ extern "C" {
 int  mtp_open(void);
 void mtp_close(void);
 
+/* Host path passed to mtpfuse as the mount point (same string as fuse_main).
+ * macOS statfs can pass the full host path; we strip this prefix so paths
+ * match the in-mount tree and per-storage totals are correct. */
+void mtp_set_fuse_mount_point(const char *mountpoint);
+
 /* Walk the entire device tree once and populate the id<->path cache.
  * Safe to call multiple times — refreshes the cache. */
 int  mtp_refresh_tree(void);
@@ -83,7 +88,9 @@ int  mtp_mkdir(const char *path);
 int  mtp_rmdir(const char *path);
 
 /* Free/total bytes for the storage volume containing `path` (from libmtp).
- * If `path` is `/` or cannot be resolved, sums all storages. Returns 0 or -errno. */
+ * If `path` is `/` or cannot be resolved, sums all storages. Returns 0 or -errno.
+ * After mtp_set_fuse_mount_point(), a full host path under that mount is
+ * accepted (macOS statfs) so each storage volume gets its own totals. */
 int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t *free_bytes);
 
 /* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */

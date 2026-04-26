@@ -59,6 +59,8 @@ typedef struct mtp_node {
 
 static LIBMTP_mtpdevice_t *g_device = NULL;
 static mtp_node_t         *g_root   = NULL;
+/* Canonical host path of the FUSE mount (for statfs path normalization). */
+static char               *g_fuse_mount_host_abs = NULL;
 static pthread_mutex_t     g_lock   = PTHREAD_MUTEX_INITIALIZER;
 /* Serialize libmtp USB I/O (library is not thread-safe). Lock order: always
  * take g_lock before g_mtp when both are needed (see mtp_close). */
@@ -287,10 +289,14 @@ static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
 {
     /* Folders often have mtime==0 on MTP; Get_Filemetadata per folder during
      * readdir/stat was stalling listings and could leave Finder showing an
-     * empty volume. Files still refresh when the listing left size/time unset. */
+     * empty volume. Files still refresh when the listing left size/time unset.
+     * Some stacks report size=0 in Get_Children metadata but a non-zero mtime;
+     * Quick Look then shows "Zero KB" until we re-query by object id. */
     if (!n || n->is_synth)
         return;
-    if (n->object_id == 0 || n->mtime != 0 || n->is_dir)
+    if (n->object_id == 0 || n->is_dir)
+        return;
+    if (n->mtime != 0 && n->size != 0u)
         return;
     pthread_mutex_lock(&g_mtp);
     if (!g_device) {
@@ -895,6 +901,50 @@ int mtp_open(void)
     return 0;
 }
 
+void mtp_set_fuse_mount_point(const char *mountpoint)
+{
+    free(g_fuse_mount_host_abs);
+    g_fuse_mount_host_abs = NULL;
+    if (!mountpoint || !mountpoint[0])
+        return;
+    char canon[PATH_MAX];
+    if (realpath(mountpoint, canon))
+        g_fuse_mount_host_abs = strdup(canon);
+    else
+        g_fuse_mount_host_abs = strdup(mountpoint);
+}
+
+/* If the kernel passes a full host path under our mount, map to "/…" in the
+ * MTP namespace so resolve() finds the right storage_id. */
+static const char *mtp_normalize_path_for_tree(const char *path, char *out, size_t outsz)
+{
+    if (!path || !out || outsz < 2u)
+        return path;
+    if (!g_fuse_mount_host_abs || !g_fuse_mount_host_abs[0])
+        return path;
+    size_t pl = strlen(g_fuse_mount_host_abs);
+    if (strncmp(path, g_fuse_mount_host_abs, pl) != 0)
+        return path;
+    if (path[pl] != '\0' && path[pl] != '/')
+        return path; /* e.g. …/Phone vs …/Phone2 — not our mount */
+    const char *tail = path + pl;
+    if (*tail == '\0') {
+        out[0] = '/';
+        out[1] = '\0';
+        return out;
+    }
+    if (*tail == '/') {
+        size_t tl = strlen(tail) + 1u;
+        if (tl > outsz)
+            return path;
+        memcpy(out, tail, tl);
+        return out;
+    }
+    if ((size_t)snprintf(out, outsz, "/%s", tail) >= outsz)
+        return path;
+    return out;
+}
+
 void mtp_close(void)
 {
     mtp_debug_log("mtp_close: begin (release tree + device)");
@@ -909,6 +959,8 @@ void mtp_close(void)
     g_cap_partial_get = -1;
     pthread_mutex_unlock(&g_mtp);
     pthread_mutex_unlock(&g_lock);
+    free(g_fuse_mount_host_abs);
+    g_fuse_mount_host_abs = NULL;
     mtp_debug_shutdown();
 }
 
@@ -934,11 +986,19 @@ int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t
     *total_bytes = 0;
     *free_bytes = 0;
 
+    char norm_buf[PATH_MAX];
+    const char *path_use = path;
+    if (path && path[0] == '/') {
+        const char *nrm = mtp_normalize_path_for_tree(path, norm_buf, sizeof norm_buf);
+        if (nrm)
+            path_use = nrm;
+    }
+
     uint32_t want_sid = 0;
     int have_node = 0;
 
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = (path && path[0] == '/') ? resolve(path) : NULL;
+    mtp_node_t *n = (path_use && path_use[0] == '/') ? resolve(path_use) : NULL;
     if (n) {
         have_node = 1;
         for (mtp_node_t *w = n; w; w = w->parent) {

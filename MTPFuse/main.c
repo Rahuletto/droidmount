@@ -44,6 +44,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* macOS statfs can pass the full host path; bridge needs it for per-storage totals. */
+    mtp_set_fuse_mount_point(argv[argc - 1]);
+
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGHUP,  on_signal);

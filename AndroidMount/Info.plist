@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>AndroidMount</string>
     <key>CFBundleIconFile</key>
-    <string>iphone</string>
+    <string>icon</string>
     <key>CFBundleIdentifier</key>
     <string>local.androidmount</string>
     <key>CFBundleInfoDictionaryVersion</key>
