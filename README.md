@@ -4,8 +4,10 @@ A native macOS menu-bar app that auto-mounts your Android phone as a
 real Finder volume over MTP, using **libmtp** + **macFUSE**.
 
 No window. No drag-and-drop app. Plug your phone in, pick "File
-Transfer" on the device, and `/Volumes/AndroidDevice` appears in the
-Finder sidebar.
+Transfer" on the device, and use the **menu bar** item → **Open in
+Finder**. The mount lives under **`~/.AndroidMount/<device-name>/`**
+(a hidden folder in your home directory; `volname` still labels the
+volume in Finder).
 
 ```
 ┌──────────────────────┐    USB    ┌─────────────┐
@@ -14,7 +16,7 @@ Finder sidebar.
 │        │             │           │  (MTP mode) │
 │        ▼             │           └─────────────┘
 │  spawns `mtpfuse`    │
-│  (C, libmtp + FUSE)  │──► /Volumes/AndroidDevice in Finder
+│  (C, libmtp + FUSE)  │──► ~/.AndroidMount/... (macFUSE volume)
 └──────────────────────┘
 ```
 
@@ -27,13 +29,26 @@ Finder sidebar.
 4. Android device with **MTP / "File Transfer"** mode enabled (not PTP
    or charge-only).
 
-## Build
+## Build and run
+
+From the directory that contains this `Makefile` (repository root):
 
 ```bash
-cd AndroidMount
 make check-deps     # verifies macFUSE + libmtp are reachable
 make                # builds build/AndroidMount.app
-make run            # launches the app
+make run            # same as: open build/AndroidMount.app
+```
+
+**Using it:** unlock the phone, set USB to **File Transfer / MTP**, then
+launch the app (or keep it running). When the menu shows **Connected**,
+choose **Open in Finder** (⌘O). **Eject** before unplugging.
+
+**Debug `mtpfuse`:** to see `[LOAD]` / libmtp logs on stderr, run the
+helper by hand after the phone is connected (adjust paths if needed):
+
+```bash
+mkdir -p "$HOME/.AndroidMount/Debug"
+./build/mtpfuse -f -o volname=Debug "$HOME/.AndroidMount/Debug"
 ```
 
 The Makefile compiles two binaries:
@@ -55,12 +70,12 @@ that built it. macOS may still prompt the first time you launch.
 * `USBWatcher.swift` – `IOServiceAddMatchingNotification` on
   `kIOUSBDeviceClassName`, filtering by known Android vendor IDs
   (Google 0x18D1, Samsung 0x04E8, etc.) and "MTP" interface strings.
-* `MountManager.swift` – on connect, spawns `mtpfuse -f -o
-  volname=<name> /Volumes/AndroidDevice`. On disconnect (or "Eject"),
-  runs `diskutil unmount force` then `terminate()` + SIGKILL fallback.
-* `mtp_bridge.c` – wraps libmtp: `LIBMTP_Init`, `Get_First_Device`,
-  `Get_Storage`, `Get_Files_And_Folders` walked lazily into an
-  in-memory `path → object_id` tree.
+* `MountManager.swift` – on connect, spawns `mtpfuse -f -o … volname=…`
+  on `~/.AndroidMount/<device>/`. On disconnect (or "Eject"), runs
+  `diskutil unmount force` then `terminate()` + SIGKILL fallback.
+* `mtp_bridge.c` – wraps libmtp: `LIBMTP_Init`, `Detect_Raw_Devices` /
+  `Open_Raw_Device_Uncached`, `Get_Storage`, `Get_Files_And_Folders`
+  **one folder level at a time** (lazy tree under `path → object_id`).
 * `fs_ops.c` – FUSE 2.x `getattr / readdir / read / write / unlink /
   mkdir / rmdir / create / release / truncate`. Reads/writes are
   staged through a per-handle temp file because MTP is request/response
@@ -69,7 +84,7 @@ that built it. macOS may still prompt the first time you launch.
 
 ## Limitations
 
-* Single device at a time (libmtp's `Get_First_Device`).
+* Single device at a time (first raw device from libmtp detection).
 * Writes happen on `release()`, so very large copies stage to `/tmp`
   first. Make sure you have enough free disk space.
 * No rename support yet (MTP rename is fiddly across vendors).
@@ -96,6 +111,24 @@ AndroidMount/
 ```
 
 ## Troubleshooting
+
+* **Finder stuck on “Loading…”** – while the mount is active, watch the trace
+  file (same PID as `mtpfuse`; stable symlink always points at the latest run):
+
+  ```bash
+  tail -f /tmp/mtpfuse-debug-latest.log
+  ```
+
+  Lines are tagged with monotonic time and pthread id. Long gaps between
+  `readdir_snapshot ENTER` and `Get_Files_And_Folders returned` mean the
+  phone/USB is slow listing that folder; a flood of `fuse open` / `mtp_read`
+  means Finder is pulling whole files (previews). Disable file logging with
+  `MTPFUSE_DEBUG=0` in the environment if you do not want `/tmp/mtpfuse-*.log`.
+
+* **“Mount point is already in use”** – usually a leftover macFUSE mount after
+  Finder or the app hung. On the next connect, the app **force-unmounts** that
+  path and stops matching `mtpfuse` processes automatically; if it still fails,
+  run **Eject** in the menu or `diskutil unmount force ~/.AndroidMount/<device>`.
 
 * **"MTPFuse helper binary not found"** – run `make` (or `make run`);
   the app looks for `mtpfuse` next to its own executable.

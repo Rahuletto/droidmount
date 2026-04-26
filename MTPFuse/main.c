@@ -33,8 +33,12 @@ int main(int argc, char *argv[])
         return 2;
     }
 
+    mtp_debug_boot(argc, argv);
+
     if (mtp_open() != 0) {
+        mtp_debug_log("mtp_open failed");
         fprintf(stderr, "mtpfuse: failed to open MTP device\n");
+        mtp_debug_shutdown();
         return 1;
     }
 
@@ -62,7 +66,9 @@ int main(int argc, char *argv[])
                                  "iosize=1048576,volname=AndroidDevice";
     }
 
+    mtp_debug_log("entering fuse_main (FUSE session start)");
     int rc = fuse_main(n, fuse_argv, &mtpfuse_ops, NULL);
+    mtp_debug_log("fuse_main returned rc=%d", rc);
     free(fuse_argv);
     mtp_close();
     return rc;

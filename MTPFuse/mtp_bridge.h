@@ -9,6 +9,16 @@
 extern "C" {
 #endif
 
+/* Debug trace file: /tmp/mtpfuse-<pid>.log and /tmp/mtpfuse-debug-latest.log
+ * Disable with env MTPFUSE_DEBUG=0. Override path with MTPFUSE_DEBUG_LOG=/path. */
+void mtp_debug_boot(int argc, char **argv);
+#if defined(__GNUC__)
+void mtp_debug_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#else
+void mtp_debug_log(const char *fmt, ...);
+#endif
+void mtp_debug_shutdown(void);
+
 /* Initialise libmtp and pick the first attached MTP device.
  * Returns 0 on success, -1 on failure. */
 int  mtp_open(void);
@@ -30,9 +40,15 @@ typedef struct {
 
 int  mtp_stat(const char *path, mtp_stat_t *out);
 
-/* Directory listing. Calls fill(name, is_dir, ctx) for every child. */
-typedef void (*mtp_dir_cb)(const char *name, int is_dir, void *ctx);
-int  mtp_readdir(const char *path, mtp_dir_cb cb, void *ctx);
+/* One directory level from cache (after MTP fetch for that folder only).
+ * Snapshot is malloc'd; free with mtp_readdir_snapshot_free. */
+typedef struct {
+    char *name;
+    int   is_dir;
+} mtp_dirent_t;
+
+int  mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out);
+void mtp_readdir_snapshot_free(mtp_dirent_t *entries, size_t n);
 
 /* Read [size] bytes at [offset] from the file at [path] into [buf].
  * Returns bytes read or -errno. */

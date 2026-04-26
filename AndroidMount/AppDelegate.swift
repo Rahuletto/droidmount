@@ -10,15 +10,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Menu bar item
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = statusItem.button {
+            // Use SF Symbol - fall back to text if not available
             if let img = NSImage(systemSymbolName: "iphone",
                                  accessibilityDescription: "AndroidMount") {
                 img.isTemplate = true
                 btn.image = img
             } else {
-                btn.title = "📱"
+                btn.title = "Android"
             }
-            // Always set a title as backup so the item is never invisible
-            if btn.image == nil { btn.title = "📱" }
+            if btn.image == nil { btn.title = "Android" }
         }
         rebuildMenu(state: .idle)
 
@@ -85,8 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .mounting(let name):
             menu.addItem(withTitle: "Mounting \(name)…", action: nil, keyEquivalent: "")
         case .mounted(let name, let path):
-            menu.addItem(withTitle: "📱 \(name)", action: nil, keyEquivalent: "")
-            menu.addItem(withTitle: "Mounted at \(path)", action: nil, keyEquivalent: "")
+            menu.addItem(withTitle: "Connected", action: nil, keyEquivalent: "")
             menu.addItem(.separator())
             let reveal = NSMenuItem(title: "Open in Finder",
                                     action: #selector(openInFinder), keyEquivalent: "o")
