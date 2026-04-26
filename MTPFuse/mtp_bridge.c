@@ -64,7 +64,10 @@ static void log_mtp_errors(void);
  * briefly takes g_mtp (same nesting order as load_children). */
 static void node_refresh_meta_if_stale_locked(mtp_node_t *n)
 {
-    if (!n || n->object_id == 0 || n->mtime != 0)
+    /* Folders often have mtime==0 on MTP; Get_Filemetadata per folder during
+     * readdir/stat was stalling listings and could leave Finder showing an
+     * empty volume. Files still refresh when the listing left size/time unset. */
+    if (!n || n->object_id == 0 || n->mtime != 0 || n->is_dir)
         return;
     pthread_mutex_lock(&g_mtp);
     if (!g_device) {
@@ -158,12 +161,22 @@ static void load_children(mtp_node_t *dir)
             dir->children_loaded = 1;
             return;
         }
-        for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
-            const char *nm = s->StorageDescription
-                                ? s->StorageDescription : "Storage";
-            if (node_find_child(dir, nm)) continue;
-            mtp_node_t *n = node_new(nm, 1, 0, s->id);
-            if (n) node_add_child(dir, n);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (attempt > 0) {
+                pthread_mutex_lock(&g_mtp);
+                if (g_device)
+                    LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
+                pthread_mutex_unlock(&g_mtp);
+            }
+            for (LIBMTP_devicestorage_t *s = g_device->storage; s; s = s->next) {
+                const char *nm = s->StorageDescription
+                                    ? s->StorageDescription : "Storage";
+                if (node_find_child(dir, nm)) continue;
+                mtp_node_t *n = node_new(nm, 1, 0, s->id);
+                if (n) node_add_child(dir, n);
+            }
+            if (dir->first_child)
+                break;
         }
         dir->children_loaded = 1;
         mtp_debug_log("[LOAD] root done %.3fs", now_sec() - t0);
@@ -516,7 +529,6 @@ int mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out)
 
     size_t i = 0;
     for (mtp_node_t *c = n->first_child; c; c = c->next_sibling) {
-        node_refresh_meta_if_stale_locked(c);
         arr[i].name    = strdup(c->name);
         arr[i].is_dir  = c->is_dir;
         arr[i].size    = c->size;

@@ -37,6 +37,18 @@ SWIFT_FLAGS ?= -O -target $(UNAME_M)-apple-macos11.0
 
 BUILD := build
 APP   := $(BUILD)/AndroidMount.app
+# App icon → Contents/Resources/iphone.icns (first existing path wins):
+#   1. icon/iphone.icns     (commit this; build/ is gitignored)
+#   2. AndroidMount/iphone.icns
+#   3. build/iphone.icns    (local only)
+#   4. system com.apple.iphone.icns
+ICNS_ICON := icon/iphone.icns
+ICNS_LEGACY := AndroidMount/iphone.icns
+ICNS_BUILD := $(BUILD)/iphone.icns
+ICNS_FALLBACK := /System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/com.apple.iphone.icns
+# Default: scripts/pack_iphone_icns.sh trims transparent edges + aspect-fills (no black letterbox).
+# NO_ASPECT_FILL_ICNS=1 copies the source .icns verbatim.
+PACK_ICNS := $(CURDIR)/scripts/pack_iphone_icns.sh
 
 C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c
 SWIFT_SRCS := \
@@ -71,6 +83,14 @@ bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse
 	@rm -rf "$(APP)"
 	@mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	@cp AndroidMount/Info.plist "$(APP)/Contents/Info.plist"
+	@OUT_ICNS="$(APP)/Contents/Resources/iphone.icns"; \
+	if [ -f "$(ICNS_ICON)" ]; then SRC="$(ICNS_ICON)"; echo "  ICNS $$SRC"; \
+	elif [ -f "$(ICNS_LEGACY)" ]; then SRC="$(ICNS_LEGACY)"; echo "  ICNS $$SRC"; \
+	elif [ -f "$(ICNS_BUILD)" ]; then SRC="$(ICNS_BUILD)"; echo "  ICNS $$SRC (build/)"; \
+	elif [ -f "$(ICNS_FALLBACK)" ]; then SRC="$(ICNS_FALLBACK)"; echo "  ICNS (system fallback)"; \
+	else echo "  ! add $(ICNS_ICON) (or $(ICNS_LEGACY))"; exit 1; fi; \
+	if [ "$${NO_ASPECT_FILL_ICNS:-}" = "1" ]; then cp "$$SRC" "$$OUT_ICNS"; \
+	else "$(PACK_ICNS)" "$$SRC" "$$OUT_ICNS"; fi
 	@cp $(BUILD)/AndroidMount.bin "$(APP)/Contents/MacOS/AndroidMount"
 	@cp $(BUILD)/mtpfuse "$(APP)/Contents/MacOS/mtpfuse"
 	@chmod +x "$(APP)/Contents/MacOS/AndroidMount" \

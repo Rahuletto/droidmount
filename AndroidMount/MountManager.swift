@@ -35,6 +35,8 @@ final class MountManager {
 
     private var sessions: [UInt32: Session] = [:]
     private let sessionsLock = NSLock()
+    private var cachedHelperPath: String?
+    private static var cachedVolIconPath: String?
 
     var hasActiveMountSessions: Bool {
         sessionsLock.lock()
@@ -55,6 +57,13 @@ final class MountManager {
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
             guard isFuseMounted(at: path) else { continue }
+            if !verifyBrowsableMtpVolume(at: path, quick: true) {
+                let stale = Session(mountPoint: path, process: nil)
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    self?.tearDown(session: stale)
+                }
+                continue
+            }
             let parts = name.split(separator: "_", omittingEmptySubsequences: false)
             guard parts.count >= 2,
                   let tail = parts.last,
@@ -90,7 +99,7 @@ final class MountManager {
         }
         sessionsLock.unlock()
 
-        guard let helper = locateHelper() else {
+        guard let helper = resolvedHelperPath() else {
             completion(.failure(MountError.helperMissing))
             return
         }
@@ -119,7 +128,7 @@ final class MountManager {
             ",volname=\(safeVol)"
 
         var argv: [String] = ["-f", "-o", fuseOpts]
-        if let v = Self.firstExistingVolumeIconPath() {
+        if let v = Self.resolvedVolumeIconPath() {
             argv.append("-o")
             argv.append("volicon=\(v)")
         }
@@ -198,6 +207,14 @@ final class MountManager {
                 for _ in 0..<40 {
                     Thread.sleep(forTimeInterval: 0.2)
                     if self.isFuseMounted(at: mountPoint) {
+                        if !self.verifyBrowsableMtpVolume(at: mountPoint) {
+                            let msg =
+                                "No storage is visible yet — unlock the phone and set USB to File transfer (MTP). " +
+                                "If it already is, try unplugging and reconnecting."
+                            returnOnce(.failure(MountError.mountFailed(msg)))
+                            self.abortEphemeralFuseMount(process: p, mountPoint: mountPoint)
+                            return
+                        }
                         self.sessionsLock.lock()
                         self.sessions[device.locationID] = Session(mountPoint: mountPoint, process: p)
                         self.sessionsLock.unlock()
@@ -317,6 +334,60 @@ final class MountManager {
         return sessions[locationID]?.mountPoint
     }
 
+    /// Charge-only / PTP-only often leaves FUSE up with an empty MTP root. Wait for at least one
+    /// real child (storage folder or any file). Slow MTP / first `Get_Storage` can take several seconds.
+    /// - Parameter quick: Shorter polling when adopting orphans at launch (avoid blocking UI).
+    private func verifyBrowsableMtpVolume(at mountPoint: String, quick: Bool = false) -> Bool {
+        let fm = FileManager.default
+        let ignored = Set([
+            ".metadata_never_index", ".DS_Store",
+        ])
+        let attempts = quick ? 18 : 70
+        let step = quick ? 0.1 : 0.2
+        for i in 0..<attempts {
+            if i > 0 {
+                Thread.sleep(forTimeInterval: step)
+            }
+            guard let names = try? fm.contentsOfDirectory(atPath: mountPoint) else { continue }
+            var meaningfulDirs = 0
+            var meaningfulFiles = 0
+            for name in names {
+                if name.hasPrefix("._") { continue }
+                if ignored.contains(name) { continue }
+                let full = (mountPoint as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
+                if isDir.boolValue {
+                    meaningfulDirs += 1
+                } else {
+                    meaningfulFiles += 1
+                }
+            }
+            if meaningfulDirs >= 1 { return true }
+            if meaningfulFiles >= 1 { return true }
+        }
+        return false
+    }
+
+    private func abortEphemeralFuseMount(process: Process, mountPoint: String) {
+        if process.isRunning {
+            process.terminate()
+        }
+        for _ in 0..<80 {
+            Thread.sleep(forTimeInterval: 0.05)
+            if !isFuseMounted(at: mountPoint), !process.isRunning { break }
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        Thread.sleep(forTimeInterval: 0.12)
+        if isFuseMounted(at: mountPoint) {
+            terminateMtpfuseProcesses(mountPoint: mountPoint)
+            runDiskutilUnmountForce(mountPoint)
+            runDiskutilUnmountForce(mountPoint)
+        }
+    }
+
     private func isFuseMounted(at path: String) -> Bool {
         var st = statfs()
         guard statfs(path, &st) == 0 else { return false }
@@ -364,9 +435,12 @@ final class MountManager {
         }
     }
 
-    private static func firstExistingVolumeIconPath() -> String? {
+    private static func resolvedVolumeIconPath() -> String? {
+        if let c = cachedVolIconPath { return c }
         let fm = FileManager.default
-        return volumeIconCandidates.first { fm.fileExists(atPath: $0) }
+        let v = volumeIconCandidates.first { fm.fileExists(atPath: $0) }
+        cachedVolIconPath = v
+        return v
     }
 
     private func terminateMtpfuseProcesses(mountPoint: String) {
@@ -414,7 +488,8 @@ final class MountManager {
         return pids
     }
 
-    private func locateHelper() -> String? {
+    private func resolvedHelperPath() -> String? {
+        if let c = cachedHelperPath { return c }
         let fm = FileManager.default
         var candidates: [String] = []
         if let bundleHelper = Bundle.main.url(forAuxiliaryExecutable: "mtpfuse")?.path {
@@ -428,6 +503,8 @@ final class MountManager {
         candidates.append("/usr/local/bin/mtpfuse")
         candidates.append("/opt/homebrew/bin/mtpfuse")
         candidates.append(FileManager.default.currentDirectoryPath + "/mtpfuse")
-        return candidates.first { fm.isExecutableFile(atPath: $0) }
+        let found = candidates.first { fm.isExecutableFile(atPath: $0) }
+        cachedHelperPath = found
+        return found
     }
 }

@@ -119,6 +119,83 @@ typedef struct {
     int   cache_ready; /* 1: temp fd has full device payload (see op_read) */
 } handle_t;
 
+/* Paths with op_create() open but not yet on the device: Finder stat()s the
+ * destination before close(); mtp_stat() would ENOENT without this. */
+typedef struct pending_create {
+    char *path;
+    handle_t *h;
+    struct pending_create *next;
+} pending_create_t;
+
+static pthread_mutex_t g_pending_mu = PTHREAD_MUTEX_INITIALIZER;
+static pending_create_t *g_pending_creates;
+
+static void pending_add(const char *path, handle_t *h)
+{
+    pending_create_t *e = malloc(sizeof(*e));
+    if (!e) return;
+    e->path = strdup(path);
+    if (!e->path) { free(e); return; }
+    e->h = h;
+    pthread_mutex_lock(&g_pending_mu);
+    e->next = g_pending_creates;
+    g_pending_creates = e;
+    pthread_mutex_unlock(&g_pending_mu);
+}
+
+static void pending_remove(handle_t *h)
+{
+    pthread_mutex_lock(&g_pending_mu);
+    pending_create_t **pp = &g_pending_creates;
+    while (*pp) {
+        if ((*pp)->h == h) {
+            pending_create_t *d = *pp;
+            *pp = d->next;
+            free(d->path);
+            free(d);
+            pthread_mutex_unlock(&g_pending_mu);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_pending_mu);
+}
+
+/* Pending getattr: 0 = filled st, 1 = not a pending create, <0 = -errno (fstat). */
+static int pending_getattr(const char *path, struct stat *st)
+{
+    pthread_mutex_lock(&g_pending_mu);
+    for (pending_create_t *e = g_pending_creates; e; e = e->next) {
+        if (strcmp(e->path, path) != 0) continue;
+        handle_t *ph = e->h;
+        if (!ph->created) continue;
+        struct stat fst;
+        if (fstat(ph->fd, &fst) < 0) {
+            int ecopy = errno;
+            pthread_mutex_unlock(&g_pending_mu);
+            return -ecopy;
+        }
+        memset(st, 0, sizeof(*st));
+        st->st_mode  = S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size  = fst.st_size;
+        if (fst.st_size)
+            st->st_blocks = (blkcnt_t)((fst.st_size + 511) / 512);
+        st->st_uid = getuid();
+        st->st_gid = getgid();
+        st->st_ino = (ino_t)(uintptr_t)ph;
+        time_t t = time(NULL);
+        st->st_mtime = st->st_atime = st->st_ctime = t;
+#if defined(__APPLE__)
+        st->st_birthtime = t;
+#endif
+        pthread_mutex_unlock(&g_pending_mu);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_pending_mu);
+    return 1;
+}
+
 static int op_getattr(const char *path, struct stat *st)
 {
     static unsigned long getattr_seq;
@@ -127,9 +204,19 @@ static int op_getattr(const char *path, struct stat *st)
     int rc = mtp_stat(path, &s);
     mtp_debug_log("fuse getattr #%lu path=%s mtp_rc=%d %.2fms",
                   ++getattr_seq, path, rc, fuse_mono_ms() - t0);
-    if (rc != 0) return rc;
-    mtp_fill_stat(&s, st);
-    return 0;
+    if (rc == 0) {
+        mtp_fill_stat(&s, st);
+        return 0;
+    }
+    if (rc == -ENOENT) {
+        int pr = pending_getattr(path, st);
+        if (pr == 0)
+            return 0;
+        if (pr < 0)
+            return pr; /* fstat failure */
+        /* pr == 1: not pending; must return real ENOENT, never -1 (ambiguous w/ EPERM). */
+    }
+    return rc;
 }
 
 /* libfuse: filler's last arg is the dirent offset for seekdir; must be
@@ -273,9 +360,9 @@ static int op_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     (void)mode;
     handle_t *h = make_handle(path);
     if (!h) return -ENOMEM;
-    h->dirty = 1;
     h->created = 1;
     h->cache_ready = 1; /* empty staging file; not on device until release */
+    pending_add(path, h);
     fi->fh = (uint64_t)(uintptr_t)h;
     return 0;
 }
@@ -362,7 +449,9 @@ static int op_release(const char *path, struct fuse_file_info *fi)
     double t0 = fuse_mono_ms();
     int was_dirty = h->dirty;
     int rc = 0;
-    if (h->dirty) {
+    /* Upload new or modified files. Created-but-empty must still be sent or
+     * the object never appears on the device. */
+    if (h->dirty || h->created) {
         off_t end = lseek(h->fd, 0, SEEK_END);
         if (end < 0)
             rc = -errno;
@@ -371,9 +460,11 @@ static int op_release(const char *path, struct fuse_file_info *fi)
             if (wr < 0) rc = wr;
         }
     }
+    if (h->created)
+        pending_remove(h);
     close(h->fd);
-    mtp_debug_log("fuse release path=%s had_dirty=%d rc=%d %.2fms",
-                  h->path, was_dirty, rc, fuse_mono_ms() - t0);
+    mtp_debug_log("fuse release path=%s had_dirty=%d created=%d rc=%d %.2fms",
+                  h->path, was_dirty, h->created, rc, fuse_mono_ms() - t0);
     free(h->path);
     free(h);
     return rc;

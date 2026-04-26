@@ -6,28 +6,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var usbWatcher: USBWatcher?
     private var mountManager: MountManager?
     private var unmountObserver: NSObjectProtocol?
-    private var sessionPollTimer: Timer?
 
     /// USB location → device info while connected (may mount async).
     private var knownDevices: [UInt32: USBDevice] = [:]
     /// Location IDs currently waiting on `MountManager.mount` (USB auto or menu “Mount”).
     private var mountingDevices: Set<UInt32> = []
+    /// Phone is connected but `mtpfuse` could not open MTP (often USB mode still “charge only”).
+    private var mtpModePending: Set<UInt32> = []
+    /// Keeps the slashed menubar icon through brief USB disconnect/reconnect (same port) without flashing plain.
+    private var mtpMenubarSlashGraceUntil: [UInt32: Date] = [:]
+    /// Don’t post another MTP-mode banner for this location until this date (USB often flaps connect/disconnect).
+    private var mtpPendingNotifySuppressedUntil: [UInt32: Date] = [:]
+    /// Minimum gap between automatic USB-triggered mounts for the same port (stops mount+failure loops).
+    private var lastUsbAutomountStart: [UInt32: Date] = [:]
+    /// Avoid re-applying the same menubar SF Symbol when state unchanged.
+    private var lastMenubarSlashedForSymbol: Bool?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.isVisible = false
         if let btn = statusItem.button {
-            if let img = PhoneSymbol.image(pointSize: 15) {
-                btn.image = img
-                btn.image?.isTemplate = true
-            } else {
-                btn.title = "Phone"
-            }
-            if btn.image == nil { btn.title = "Phone" }
+            Self.applyPhoneSymbol(to: btn, slashed: false)
         }
 
         mountManager = MountManager()
         mergeAdoptedOrphanDevices()
+        applyApplicationIconFromBundle()
         configureUserNotifications()
 
         usbWatcher = USBWatcher { [weak self] event in
@@ -41,26 +45,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         ) { [weak self] _ in
             guard let self = self else { return }
             if self.mountManager?.reconcileStaleSessions() == true {
-                self.rebuildMenu()
+                self.rebuildMenu(reconcileSessions: false)
             }
         }
-
-        let poll = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self,
-                  let mm = self.mountManager,
-                  !self.knownDevices.isEmpty,
-                  mm.hasActiveMountSessions else { return }
-            if mm.reconcileStaleSessions() {
-                self.rebuildMenu()
-            }
-        }
-        sessionPollTimer = poll
-        RunLoop.main.add(poll, forMode: .common)
 
         rebuildMenu()
 
-        if !FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs") &&
-           !FileManager.default.fileExists(atPath: "/Library/Filesystems/osxfuse.fs") {
+        let hasMacFuse = FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs")
+            || FileManager.default.fileExists(atPath: "/Library/Filesystems/osxfuse.fs")
+        if !hasMacFuse {
             statusItem.isVisible = true
             showMacFuseAlert()
             rebuildMenu()
@@ -83,8 +76,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        sessionPollTimer?.invalidate()
-        sessionPollTimer = nil
         if let o = unmountObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(o)
             unmountObserver = nil
@@ -96,8 +87,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func handleUSB(_ event: USBEvent) {
         switch event {
         case .connected(let dev):
-            knownDevices[dev.locationID] = dev
-            mountingDevices.insert(dev.locationID)
+            let loc = dev.locationID
+            knownDevices[loc] = dev
+            if mountingDevices.contains(loc) {
+                rebuildMenu()
+                return
+            }
+            let now = Date()
+            if let last = lastUsbAutomountStart[loc], now.timeIntervalSince(last) < 10.0 {
+                rebuildMenu()
+                return
+            }
+            lastUsbAutomountStart[loc] = now
+            mountingDevices.insert(loc)
             rebuildMenu()
             mountManager?.mount(device: dev) { [weak self] result in
                 DispatchQueue.main.async {
@@ -105,9 +107,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     self.mountingDevices.remove(dev.locationID)
                     switch result {
                     case .success(let mountPath):
+                        let loc = dev.locationID
+                        self.mtpModePending.remove(loc)
+                        self.mtpMenubarSlashGraceUntil.removeValue(forKey: loc)
+                        self.mtpPendingNotifySuppressedUntil.removeValue(forKey: loc)
                         self.rebuildMenu()
+                        self.openMountInFinder(path: mountPath)
                         self.postDeviceConnectedNotification(deviceName: dev.name, mountPath: mountPath)
                     case .failure(let err):
+                        if Self.isLikelyMTPModePendingError(err) {
+                            self.knownDevices[dev.locationID] = dev
+                            self.mtpModePending.insert(dev.locationID)
+                            self.mtpMenubarSlashGraceUntil[dev.locationID] =
+                                Date().addingTimeInterval(Self.mtpMenubarSlashGraceSeconds)
+                            self.rebuildMenu()
+                            self.postMTPModePendingNotificationIfAllowed(
+                                deviceName: dev.name,
+                                locationID: dev.locationID)
+                            return
+                        }
+                        self.mtpModePending.remove(dev.locationID)
+                        self.mtpMenubarSlashGraceUntil.removeValue(forKey: dev.locationID)
+                        self.mtpPendingNotifySuppressedUntil.removeValue(forKey: dev.locationID)
                         self.knownDevices.removeValue(forKey: dev.locationID)
                         let anyLeft = !self.knownDevices.isEmpty || !self.mountingDevices.isEmpty
                             || (self.mountManager?.hasActiveMountSessions ?? false)
@@ -121,15 +142,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 }
             }
         case .disconnected(let dev):
-            knownDevices.removeValue(forKey: dev.locationID)
-            mountManager?.unmount(locationID: dev.locationID)
+            let loc = dev.locationID
+            knownDevices.removeValue(forKey: loc)
+            mtpModePending.remove(loc)
+            lastUsbAutomountStart.removeValue(forKey: loc)
+            mountManager?.unmount(locationID: loc)
             rebuildMenu()
         }
     }
 
-    private func rebuildMenu(error: String? = nil, for failed: USBDevice? = nil) {
+    private func rebuildMenu(error: String? = nil, for failed: USBDevice? = nil, reconcileSessions: Bool = true) {
         let menu = NSMenu()
-        mountManager?.reconcileStaleSessions()
+        if reconcileSessions {
+            mountManager?.reconcileStaleSessions()
+        }
         guard let mm = mountManager else {
             menu.addItem(withTitle: "Starting…", action: nil, keyEquivalent: "")
             menu.addItem(.separator())
@@ -154,12 +180,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let header = NSMenuItem(title: "Devices", action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
+            var anyMounted = false
             for (loc, dev) in sortedDevs {
                 let sub = NSMenu()
                 let path = mm.mountPoint(for: loc)
                 let isMounting = mountingDevices.contains(loc)
+                let pendingMtp = mtpModePending.contains(loc)
 
                 if let mp = path {
+                    anyMounted = true
                     let open = NSMenuItem(title: "Show in Finder", action: #selector(openMount(_:)), keyEquivalent: "o")
                     open.target = self
                     open.representedObject = mp
@@ -171,22 +200,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 } else if isMounting {
                     let pending = NSMenuItem(title: "Mounting…", action: nil, keyEquivalent: "")
                     pending.isEnabled = false
-                    pending.image = Self.sfMenuIcon("arrow.triangle.2.circlepath")
+                    pending.image = Self.cachedSfMenuIconSpinner()
                     sub.addItem(pending)
                 } else {
-                    let mountItem = NSMenuItem(title: "Mount", action: #selector(mountOne(_:)), keyEquivalent: "")
+                    if pendingMtp {
+                        let hint = NSMenuItem(
+                            title: "Not in MTP mode — on the phone choose File transfer (MTP)",
+                            action: nil,
+                            keyEquivalent: "")
+                        hint.isEnabled = false
+                        sub.addItem(hint)
+                    }
+                    let mountTitle = pendingMtp ? "Retry mount" : "Mount"
+                    let mountItem = NSMenuItem(title: mountTitle, action: #selector(mountOne(_:)), keyEquivalent: "")
                     mountItem.target = self
                     mountItem.representedObject = NSNumber(value: loc)
-                    mountItem.image = Self.sfMenuIcon("externaldrive.badge.plus")
+                    mountItem.image = Self.cachedSfMenuIconMount()
                     sub.addItem(mountItem)
                 }
 
                 let item = NSMenuItem(title: dev.name, action: nil, keyEquivalent: "")
                 item.submenu = sub
-                item.image = Self.phoneMenuIcon()
+                item.image = pendingMtp ? Self.slashedPhoneMenuIcon() : Self.phoneMenuIcon()
                 menu.addItem(item)
             }
-            if sortedDevs.contains(where: { mm.mountPoint(for: $0.key) != nil }) {
+            if anyMounted {
                 menu.addItem(.separator())
                 let ejectAll = NSMenuItem(title: "Eject all", action: #selector(ejectAll), keyEquivalent: "e")
                 ejectAll.target = self
@@ -198,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         menu.addItem(withTitle: "Quit AndroidMount", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
         syncStatusItemVisibility(hasMountManager: true)
+        refreshStatusItemSymbol()
     }
 
     /// Menubar agent: only show the icon when MTP-capable hardware is in play (or an active mount we track).
@@ -212,15 +251,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         statusItem.isVisible = active
     }
 
+    private func refreshStatusItemSymbol() {
+        guard let btn = statusItem.button else { return }
+        let slashed = shouldShowSlashedMenubarIcon()
+        if lastMenubarSlashedForSymbol == slashed { return }
+        lastMenubarSlashedForSymbol = slashed
+        Self.applyPhoneSymbol(to: btn, slashed: slashed)
+    }
+
+    private func shouldShowSlashedMenubarIcon() -> Bool {
+        if !mtpModePending.isEmpty { return true }
+        guard let mm = mountManager else { return false }
+        let now = Date()
+        for (loc, _) in knownDevices {
+            guard let until = mtpMenubarSlashGraceUntil[loc], now < until else { continue }
+            if mm.mountPoint(for: loc) != nil { continue }
+            return true
+        }
+        return false
+    }
+
+    /// MTP-pending: SF Symbol slash / alert variants via `PhoneSymbol` (native vectors, no bitmap compositing).
+    private static func applyPhoneSymbol(to button: NSButton, slashed: Bool) {
+        let plainSize: CGFloat = 16
+        if let img = PhoneSymbol.image(pointSize: plainSize, slashed: slashed) {
+            button.image = img
+            button.image?.isTemplate = true
+            button.title = ""
+        } else {
+            button.image = nil
+            button.title = slashed ? "MTP" : "Phone"
+        }
+    }
+
+    /// Heuristic: `mtpfuse` exited early because libmtp could not see an MTP session (wrong USB mode, locked, etc.).
+    private static func isLikelyMTPModePendingError(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        if text.contains("out of memory") || text.contains("node_new(root)") { return false }
+        let markers = [
+            "failed to open mtp device",
+            "no mtp device found",
+            "file transfer mode",
+            "no device with bus_location",
+            "libmtp_open_raw_device failed",
+            "is the phone unlocked",
+            ", n=0",
+            "no storage is visible",
+            "no storage visible",
+        ]
+        if markers.contains(where: { text.contains($0) }) { return true }
+        if text.contains("timed out waiting for fuse mount"),
+           text.contains("detect returned") || text.contains("no mtp") {
+            return true
+        }
+        return false
+    }
+
     @objc private func openMount(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         openMountInFinder(path: path)
     }
 
     private func openMountInFinder(path: String) {
-        guard Self.isPathUnderAndroidMount(path),
+        guard isPathUnderAndroidMount(path),
               FileManager.default.fileExists(atPath: path) else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     @objc private func ejectOne(_ sender: NSMenuItem) {
@@ -248,28 +344,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 self.mountingDevices.remove(loc)
                 switch result {
                 case .success(let mountPath):
+                    self.mtpModePending.remove(loc)
+                    self.mtpMenubarSlashGraceUntil.removeValue(forKey: loc)
+                    self.mtpPendingNotifySuppressedUntil.removeValue(forKey: loc)
                     self.rebuildMenu()
+                    self.openMountInFinder(path: mountPath)
                     self.postDeviceConnectedNotification(deviceName: dev.name, mountPath: mountPath)
                 case .failure(let err):
-                    self.rebuildMenu(error: err.localizedDescription, for: dev)
+                    if Self.isLikelyMTPModePendingError(err) {
+                        self.mtpModePending.insert(loc)
+                        self.mtpMenubarSlashGraceUntil[loc] =
+                            Date().addingTimeInterval(Self.mtpMenubarSlashGraceSeconds)
+                        self.rebuildMenu()
+                        self.postMTPModePendingNotificationIfAllowed(deviceName: dev.name, locationID: loc)
+                    } else {
+                        self.mtpModePending.remove(loc)
+                        self.mtpMenubarSlashGraceUntil.removeValue(forKey: loc)
+                        self.mtpPendingNotifySuppressedUntil.removeValue(forKey: loc)
+                        self.rebuildMenu(error: err.localizedDescription, for: dev)
+                    }
                 }
             }
         }
     }
 
-    private static func sfMenuIcon(_ name: String) -> NSImage? {
+    private static let menuIconLock = NSLock()
+    private static var menuIconSpinner: NSImage?
+    private static var menuIconMount: NSImage?
+
+    private static func cachedSfMenuIconSpinner() -> NSImage? {
+        menuIconLock.lock()
+        defer { menuIconLock.unlock() }
+        if menuIconSpinner == nil {
+            menuIconSpinner = sfMenuIconUncached("arrow.triangle.2.circlepath")
+        }
+        return menuIconSpinner.flatMap { $0.copy() as? NSImage }
+    }
+
+    private static func cachedSfMenuIconMount() -> NSImage? {
+        menuIconLock.lock()
+        defer { menuIconLock.unlock() }
+        if menuIconMount == nil {
+            menuIconMount = sfMenuIconUncached("externaldrive.badge.plus")
+        }
+        return menuIconMount.flatMap { $0.copy() as? NSImage }
+    }
+
+    private static func sfMenuIconUncached(_ name: String) -> NSImage? {
         guard let raw = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
         let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
         let img = raw.withSymbolConfiguration(cfg) ?? raw
         img.isTemplate = true
-        let s = NSSize(width: 16, height: 16)
-        img.size = s
+        img.size = NSSize(width: 16, height: 16)
         return img
     }
 
     private static func phoneMenuIcon() -> NSImage? {
         guard let img = PhoneSymbol.image(pointSize: 13) else { return nil }
         img.isTemplate = true
+        img.size = NSSize(width: 16, height: 16)
+        return img
+    }
+
+    private static func slashedPhoneMenuIcon() -> NSImage? {
+        guard let img = PhoneSymbol.image(pointSize: 13, slashed: true) else { return phoneMenuIcon() }
         img.size = NSSize(width: 16, height: 16)
         return img
     }
@@ -282,15 +420,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         a.runModal()
     }
 
-    private static func isPathUnderAndroidMount(_ path: String) -> Bool {
+    private func isPathUnderAndroidMount(_ path: String) -> Bool {
+        let p = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".AndroidMount", isDirectory: true).standardizedFileURL.path
-        let p = URL(fileURLWithPath: path).standardizedFileURL.path
+            .appendingPathComponent(".AndroidMount", isDirectory: true)
+            .resolvingSymlinksInPath().path
         if p == root { return true }
-        return p.hasPrefix(root + "/")
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        return p.hasPrefix(prefix)
     }
 
     // MARK: - User notifications
+
+    /// Helps some contexts (e.g. notifications) pick up artwork; `CFBundleIconFile` is still the bundle app icon.
+    private func applyApplicationIconFromBundle() {
+        guard let url = Bundle.main.url(forResource: "iphone", withExtension: "icns"),
+              let image = NSImage(contentsOf: url),
+              let filled = Self.nsImageAspectFill(from: image, pixelSide: 512) else { return }
+        NSApp.applicationIconImage = filled
+    }
 
     private func configureUserNotifications() {
         let viewFinder = UNNotificationAction(
@@ -306,6 +454,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         center.setNotificationCategories([category])
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private static let mtpPendingBannerQuietSeconds: TimeInterval = 150
+    private static let mtpMenubarSlashGraceSeconds: TimeInterval = 180
+
+    private func postMTPModePendingNotificationIfAllowed(deviceName: String, locationID: UInt32) {
+        let now = Date()
+        if let until = mtpPendingNotifySuppressedUntil[locationID], now < until {
+            return
+        }
+        mtpPendingNotifySuppressedUntil[locationID] = now.addingTimeInterval(Self.mtpPendingBannerQuietSeconds)
+        postMTPModePendingNotification(deviceName: deviceName, locationID: locationID)
+    }
+
+    private func postMTPModePendingNotification(deviceName: String, locationID: UInt32) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(deviceName): not in MTP mode yet"
+        content.body = "On the phone, switch USB to File transfer (MTP) to access files. Then choose Retry mount in the AndroidMount menu bar."
+        content.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.05, repeats: false)
+        let id = "mtp-pending-\(locationID)"
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [id])
+        center.removePendingNotificationRequests(withIdentifiers: [id])
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        center.add(request)
     }
 
     private func postDeviceConnectedNotification(deviceName: String, mountPath: String) {
@@ -350,6 +525,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private static let notificationCategoryDeviceMounted = "DEVICE_MOUNTED"
     private static let notificationActionViewFinder = "VIEW_FINDER"
     private static let notificationUserInfoPath = "path"
+
+    /// Scale + center-crop so artwork fills the square (removes empty transparent “padding” in source icons).
+    private static func nsImageAspectFill(from source: NSImage, pixelSide: Int) -> NSImage? {
+        guard let rep = bitmapAspectFillRep(from: source, pixelSide: pixelSide) else { return nil }
+        let side = CGFloat(pixelSide)
+        let img = NSImage(size: NSSize(width: side, height: side))
+        img.addRepresentation(rep)
+        return img
+    }
+
+    private static func bitmapAspectFillRep(from source: NSImage, pixelSide: Int) -> NSBitmapImageRep? {
+        let side = CGFloat(pixelSide)
+        let imageSize = source.size
+        guard imageSize.width > 0, imageSize.height > 0,
+              let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: pixelSide,
+                pixelsHigh: pixelSide,
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0) else { return nil }
+        rep.size = NSSize(width: side, height: side)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .high
+        let scale = max(side / imageSize.width, side / imageSize.height)
+        let w = imageSize.width * scale
+        let h = imageSize.height * scale
+        let x = (side - w) / 2
+        let y = (side - h) / 2
+        source.draw(
+            in: NSRect(x: x, y: y, width: w, height: h),
+            from: NSRect(origin: .zero, size: imageSize),
+            operation: .copy,
+            fraction: 1.0,
+            respectFlipped: false,
+            hints: [.interpolation: NSImageInterpolation.high])
+        NSGraphicsContext.restoreGraphicsState()
+        return rep
+    }
 
     private func showMacFuseAlert() {
         let alert = NSAlert()
