@@ -21,7 +21,8 @@ final class MountManager {
 
     private struct Session {
         let mountPoint: String
-        let process: Process
+        /// Nil when the session was **adopted** after relaunch (FUSE still up; we didn’t spawn this `Process`).
+        let process: Process?
     }
 
     private let parentDir: String = "\(NSHomeDirectory())/.AndroidMount"
@@ -39,6 +40,33 @@ final class MountManager {
         sessionsLock.lock()
         defer { sessionsLock.unlock() }
         return !sessions.isEmpty
+    }
+
+    /// If the app restarts while `mtpfuse` is still mounted, USB state is empty but `~/.AndroidMount/<name>_<locHex>`
+    /// still exists. Recover menu + eject by parsing the location id from the folder name.
+    func adoptOrphanMountsIfNeeded() -> [(locationID: UInt32, displayName: String)] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: parentDir) else { return [] }
+        var out: [(locationID: UInt32, displayName: String)] = []
+        sessionsLock.lock()
+        defer { sessionsLock.unlock() }
+        for name in entries {
+            let path = "\(parentDir)/\(name)"
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+            guard isFuseMounted(at: path) else { continue }
+            let parts = name.split(separator: "_", omittingEmptySubsequences: false)
+            guard parts.count >= 2,
+                  let tail = parts.last,
+                  tail.count == 8,
+                  let lid = UInt32(tail, radix: 16) else { continue }
+            if sessions[lid] != nil { continue }
+            let baseParts = parts.dropLast()
+            let display = baseParts.isEmpty ? name : baseParts.joined(separator: "_")
+            sessions[lid] = Session(mountPoint: path, process: nil)
+            out.append((locationID: lid, displayName: display))
+        }
+        return out
     }
 
     private static func sanitizeVolumeLabel(_ name: String) -> String {
@@ -211,19 +239,20 @@ final class MountManager {
 
     private func tearDown(session: Session) {
         let mp = session.mountPoint
-        let p = session.process
 
-        if p.isRunning {
-            p.terminate()
-        }
-        var waited = 0
-        while p.isRunning && waited < 80 {
-            Thread.sleep(forTimeInterval: 0.05)
-            waited += 1
-        }
-        if p.isRunning {
-            kill(p.processIdentifier, SIGKILL)
-            Thread.sleep(forTimeInterval: 0.15)
+        if let p = session.process {
+            if p.isRunning {
+                p.terminate()
+            }
+            var waited = 0
+            while p.isRunning && waited < 80 {
+                Thread.sleep(forTimeInterval: 0.05)
+                waited += 1
+            }
+            if p.isRunning {
+                kill(p.processIdentifier, SIGKILL)
+                Thread.sleep(forTimeInterval: 0.15)
+            }
         }
 
         terminateMtpfuseProcesses(mountPoint: mp)

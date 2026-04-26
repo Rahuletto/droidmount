@@ -25,6 +25,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         mountManager = MountManager()
+        mergeAdoptedOrphanDevices()
+
         usbWatcher = USBWatcher { [weak self] event in
             DispatchQueue.main.async { self?.handleUSB(event) }
         }
@@ -56,10 +58,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !FileManager.default.fileExists(atPath: "/Library/Filesystems/macfuse.fs") &&
            !FileManager.default.fileExists(atPath: "/Library/Filesystems/osxfuse.fs") {
+            statusItem.isVisible = true
             showMacFuseAlert()
+            rebuildMenu()
         }
 
         usbWatcher?.start()
+    }
+
+    /// After relaunch, FUSE may still be mounted while `knownDevices` is empty — scan `~/.AndroidMount`.
+    private func mergeAdoptedOrphanDevices() {
+        guard let mm = mountManager else { return }
+        for row in mm.adoptOrphanMountsIfNeeded() {
+            if knownDevices[row.locationID] != nil { continue }
+            knownDevices[row.locationID] = USBDevice(
+                name: row.displayName,
+                vendorID: 0,
+                productID: 0,
+                locationID: row.locationID)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -88,7 +105,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.rebuildMenu()
                     case .failure(let err):
                         self.knownDevices.removeValue(forKey: dev.locationID)
-                        self.rebuildMenu(error: err.localizedDescription, for: dev)
+                        let anyLeft = !self.knownDevices.isEmpty || !self.mountingDevices.isEmpty
+                            || (self.mountManager?.hasActiveMountSessions ?? false)
+                        if anyLeft {
+                            self.rebuildMenu(error: err.localizedDescription, for: dev)
+                        } else {
+                            Self.presentMountFailureAlert(device: dev, error: err)
+                            self.rebuildMenu()
+                        }
                     }
                 }
             }
@@ -107,6 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
             menu.addItem(withTitle: "Quit AndroidMount", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             statusItem.menu = menu
+            statusItem.isVisible = false
             return
         }
 
@@ -168,6 +193,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit AndroidMount", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
+        syncStatusItemVisibility(hasMountManager: true)
+    }
+
+    /// Menubar agent: only show the icon when MTP-capable hardware is in play (or an active mount we track).
+    private func syncStatusItemVisibility(hasMountManager: Bool) {
+        guard hasMountManager else {
+            statusItem.isVisible = false
+            return
+        }
+        let active = !knownDevices.isEmpty
+            || !mountingDevices.isEmpty
+            || (mountManager?.hasActiveMountSessions ?? false)
+        statusItem.isVisible = active
     }
 
     @objc private func openMount(_ sender: NSMenuItem) {
@@ -225,6 +263,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         img.isTemplate = true
         img.size = NSSize(width: 16, height: 16)
         return img
+    }
+
+    private static func presentMountFailureAlert(device: USBDevice, error: Error) {
+        let a = NSAlert()
+        a.messageText = "Could not mount \(device.name)"
+        a.informativeText = error.localizedDescription
+        a.alertStyle = .warning
+        a.runModal()
     }
 
     private static func isPathUnderAndroidMount(_ path: String) -> Bool {
