@@ -61,7 +61,7 @@ mtpfuse: $(BUILD)/mtpfuse
 $(BUILD)/AndroidMount.bin: $(SWIFT_SRCS) | $(BUILD)
 	@echo "  SWIFT AndroidMount"
 	@$(SWIFT) $(SWIFT_FLAGS) -o $@ $(SWIFT_SRCS) \
-	    -framework Cocoa -framework IOKit
+	    -framework Cocoa -framework IOKit -framework UserNotifications
 
 app: $(BUILD)/AndroidMount.bin
 

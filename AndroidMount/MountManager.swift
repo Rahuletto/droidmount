@@ -138,8 +138,19 @@ final class MountManager {
         let errPipe = Pipe()
         p.standardError = errPipe
         p.standardOutput = Pipe()
+
+        let stderrLock = NSLock()
+        var stderrBuf = Data()
+        let stderrMax = 64 * 1024
         errPipe.fileHandleForReading.readabilityHandler = { handle in
-            _ = handle.availableData
+            let chunk = handle.availableData
+            if chunk.isEmpty { return }
+            stderrLock.lock()
+            if stderrBuf.count < stderrMax {
+                let room = stderrMax - stderrBuf.count
+                stderrBuf.append(chunk.prefix(room))
+            }
+            stderrLock.unlock()
         }
 
         var didReturn = false
@@ -147,11 +158,35 @@ final class MountManager {
             if !didReturn { didReturn = true; completion(r) }
         }
 
+        func drainStderrText() -> String {
+            stderrLock.lock()
+            let snap = stderrBuf
+            stderrLock.unlock()
+            let t = String(data: snap, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return t
+        }
+
         p.terminationHandler = { proc in
             errPipe.fileHandleForReading.readabilityHandler = nil
+            let remainder = errPipe.fileHandleForReading.readDataToEndOfFile()
+            if !remainder.isEmpty {
+                stderrLock.lock()
+                if stderrBuf.count < stderrMax {
+                    let room = stderrMax - stderrBuf.count
+                    stderrBuf.append(remainder.prefix(room))
+                }
+                stderrLock.unlock()
+            }
             if !didReturn {
-                let data = errPipe.fileHandleForReading.readDataToEndOfFile()
-                let msg = String(data: data, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
+                let fromPipe = drainStderrText()
+                let code = proc.terminationStatus
+                let msg: String
+                if fromPipe.isEmpty {
+                    msg = "process exited with status \(code) before the volume appeared (no output on stderr). Is the phone in File transfer / MTP mode and unlocked?"
+                } else {
+                    msg = fromPipe
+                }
                 returnOnce(.failure(MountError.mountFailed(msg)))
             }
         }
@@ -178,7 +213,14 @@ final class MountManager {
                         if p.isRunning { kill(p.processIdentifier, SIGKILL) }
                     }
                 }
-                returnOnce(.failure(MountError.mountFailed("timed out waiting for mount")))
+                let errTail = drainStderrText()
+                var detail = "timed out waiting for FUSE mount (~8s)."
+                if !errTail.isEmpty {
+                    detail += " mtpfuse said:\n" + errTail
+                } else if !p.isRunning {
+                    detail += " mtpfuse exited before the volume appeared; check MTP mode and USB connection."
+                }
+                returnOnce(.failure(MountError.mountFailed(detail)))
             }
         } catch {
             completion(.failure(error))

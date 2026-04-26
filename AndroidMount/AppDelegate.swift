@@ -1,6 +1,7 @@
 import Cocoa
+import UserNotifications
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem!
     private var usbWatcher: USBWatcher?
     private var mountManager: MountManager?
@@ -14,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.isVisible = false
         if let btn = statusItem.button {
             if let img = PhoneSymbol.image(pointSize: 15) {
                 btn.image = img
@@ -26,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         mountManager = MountManager()
         mergeAdoptedOrphanDevices()
+        configureUserNotifications()
 
         usbWatcher = USBWatcher { [weak self] event in
             DispatchQueue.main.async { self?.handleUSB(event) }
@@ -101,8 +104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self = self else { return }
                     self.mountingDevices.remove(dev.locationID)
                     switch result {
-                    case .success:
+                    case .success(let mountPath):
                         self.rebuildMenu()
+                        self.postDeviceConnectedNotification(deviceName: dev.name, mountPath: mountPath)
                     case .failure(let err):
                         self.knownDevices.removeValue(forKey: dev.locationID)
                         let anyLeft = !self.knownDevices.isEmpty || !self.mountingDevices.isEmpty
@@ -210,6 +214,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openMount(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
+        openMountInFinder(path: path)
+    }
+
+    private func openMountInFinder(path: String) {
         guard Self.isPathUnderAndroidMount(path),
               FileManager.default.fileExists(atPath: path) else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: path))
@@ -239,8 +247,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.mountingDevices.remove(loc)
                 switch result {
-                case .success:
+                case .success(let mountPath):
                     self.rebuildMenu()
+                    self.postDeviceConnectedNotification(deviceName: dev.name, mountPath: mountPath)
                 case .failure(let err):
                     self.rebuildMenu(error: err.localizedDescription, for: dev)
                 }
@@ -280,6 +289,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if p == root { return true }
         return p.hasPrefix(root + "/")
     }
+
+    // MARK: - User notifications
+
+    private func configureUserNotifications() {
+        let viewFinder = UNNotificationAction(
+            identifier: Self.notificationActionViewFinder,
+            title: "View in Finder",
+            options: [.foreground])
+        let category = UNNotificationCategory(
+            identifier: Self.notificationCategoryDeviceMounted,
+            actions: [viewFinder],
+            intentIdentifiers: [],
+            options: [])
+        let center = UNUserNotificationCenter.current()
+        center.setNotificationCategories([category])
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func postDeviceConnectedNotification(deviceName: String, mountPath: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(deviceName) connected"
+        content.body = "Your device is ready. You can browse files in Finder."
+        content.sound = .default
+        content.categoryIdentifier = Self.notificationCategoryDeviceMounted
+        content.userInfo = [Self.notificationUserInfoPath: mountPath]
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.05, repeats: false)
+        let id = UUID().uuidString
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completion: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completion([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completion: @escaping () -> Void
+    ) {
+        defer { completion() }
+        let info = response.notification.request.content.userInfo
+        guard let path = info[Self.notificationUserInfoPath] as? String else { return }
+        switch response.actionIdentifier {
+        case UNNotificationDefaultActionIdentifier,
+             Self.notificationActionViewFinder:
+            openMountInFinder(path: path)
+        default:
+            break
+        }
+    }
+
+    private static let notificationCategoryDeviceMounted = "DEVICE_MOUNTED"
+    private static let notificationActionViewFinder = "VIEW_FINDER"
+    private static let notificationUserInfoPath = "path"
 
     private func showMacFuseAlert() {
         let alert = NSAlert()
