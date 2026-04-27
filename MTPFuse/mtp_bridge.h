@@ -106,6 +106,9 @@ void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx),
 /* Drop cached children under this in-mount path; next readdir refetches from the device. */
 void mtp_invalidate_fuse_dir_cache(const char *fuse_path);
 
+/* macOS: send immediate invalidation pulse for path (called after transfers). */
+void mtp_invalidate_fuse_path(const char *path);
+
 /* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */
 int mtp_root_volume_icon_active(void);
 

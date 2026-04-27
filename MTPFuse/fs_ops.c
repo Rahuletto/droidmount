@@ -5,9 +5,11 @@
  * creates a backing temp file that we either populate from the device
  * (for read access) or leave empty (for create). Reads/writes normally
  * hit the staging fd. When the device supports GetPartialObject and the
- * file is larger than MTP_OP_OPEN_PREFETCH_MAX, read-only (or read‑first
- * RDWR) opens stream via libmtp partial reads instead of a multi‑GB
- * Get_File, which avoids Finder “device disappeared” on long USB pulls.
+ * file is larger than the per-open prefetch cap, read-only (or read‑first
+ * RDWR) opens stream via partial reads instead of a multi‑GB Get_File,
+ * which avoids Finder “device disappeared” on long USB pulls. Known media
+ * extensions use a much larger cap so duplicates use one full-object pull
+ * aligned with device bytes (metadata size is often wrong for MP4).
  * On release, if the file was written, the staging fd is passed to
  * mtp_write_full_fd() → LIBMTP_Send_File_From_File_Descriptor, which streams
  * bytes from that fd to the device (no extra full-file copy). Staging uses
@@ -36,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -86,11 +89,34 @@ static void *mtp_remote_inval_loop(void *arg)
  * Finder touching them during folder browse won't pull gigabytes up front.
  * Reduced from 64MB to 16MB to avoid freezing on moderately-large files. */
 #define MTP_OP_OPEN_PREFETCH_MAX ((uint64_t)16 * 1024 * 1024)
+/* Full-object prefetch cap for typical camera/video extensions so Finder
+ * duplicates use Get_File (byte-faithful) instead of partial reads when
+ * ObjectCompressedSize disagrees with the wire. */
+#define MTP_OP_OPEN_MEDIA_PREFETCH_MAX ((uint64_t)512 * 1024 * 1024)
 /* Match default mount iosize (2MiB); st_blksize=0 confuses some media stacks (QuickTime). */
 #define MTP_ST_BLKSIZE (2097152)
 
 /* Serializes lazy mtp_download_to_fd for one handle; never nest with g_lock. */
 static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int path_use_full_mtp_fetch(const char *path)
+{
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char *dot = strrchr(base, '.');
+    if (!dot || dot == base)
+        return 0;
+    dot++;
+    static const char *const exts[] = {
+        "mp4", "mov", "m4v", "m4a", "mkv", "avi", "3gp", "webm",
+        "heic", "jpeg", "jpg", "png", NULL,
+    };
+    for (int i = 0; exts[i]; i++) {
+        if (strcasecmp(dot, exts[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 static double fuse_mono_ms(void)
 {
@@ -305,12 +331,29 @@ typedef struct xa_ent {
     char          *name;
     unsigned char *val;
     size_t         vlen;
+    uint32_t       path_hash;  /* hash of path for faster comparison */
 } xa_ent_t;
 
-static xa_ent_t       *g_xa;
+/* Hash table with 64 buckets (power of 2 for fast modulo) */
+#define XA_BUCKET_COUNT 64
+static xa_ent_t       *g_xa_buckets[XA_BUCKET_COUNT];
 static pthread_mutex_t g_xa_mu = PTHREAD_MUTEX_INITIALIZER;
 
 enum { XA_MAX_NODES = 450, XA_MAX_VALUE = 65536 };
+
+/* Simple hash function for (path,name) combination */
+static uint32_t xa_hash(const char *path, const char *name)
+{
+    uint32_t h = 5381;
+    int c;
+    /* Hash path */
+    while ((c = (unsigned char)*path++))
+        h = ((h << 5) + h) + c;
+    /* Hash name */
+    while ((c = (unsigned char)*name++))
+        h = ((h << 5) + h) + c;
+    return h;
+}
 
 static void xa_free_ent(xa_ent_t *e)
 {
@@ -325,21 +368,41 @@ static void xa_free_ent(xa_ent_t *e)
 static size_t xa_count_unlocked(void)
 {
     size_t n = 0;
-    for (xa_ent_t *e = g_xa; e; e = e->next)
-        n++;
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        for (xa_ent_t *e = g_xa_buckets[i]; e; e = e->next)
+            n++;
+    }
     return n;
 }
 
 static void xa_evict_tail_unlocked(void)
 {
-    if (!g_xa)
-        return;
-    xa_ent_t **pp = &g_xa;
-    while ((*pp)->next)
-        pp = &(*pp)->next;
-    xa_ent_t *d = *pp;
-    *pp = NULL;
-    xa_free_ent(d);
+    /* Find the last entry across all buckets */
+    xa_ent_t *last = NULL;
+    xa_ent_t *last_prev = NULL;
+    int last_bucket = -1;
+    
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        xa_ent_t **pp = &g_xa_buckets[i];
+        while (*pp) {
+            last_prev = *pp;
+            pp = &(*pp)->next;
+        }
+        if (last_prev) {
+            last = last_prev;
+            last_bucket = i;
+        }
+    }
+    
+    if (last) {
+        xa_ent_t **pp = &g_xa_buckets[last_bucket];
+        while (*pp && *pp != last)
+            pp = &(*pp)->next;
+        if (*pp) {
+            *pp = last->next;
+            xa_free_ent(last);
+        }
+    }
 }
 
 static int path_has_prefix(const char *path, const char *prefix)
@@ -356,23 +419,31 @@ static void xa_rename_paths(const char *from, const char *to)
 {
     size_t fl = strlen(from);
     pthread_mutex_lock(&g_xa_mu);
-    for (xa_ent_t *e = g_xa; e; e = e->next) {
-        const char *p = e->path;
-        char       *np = NULL;
-        if (strcmp(p, from) == 0) {
-            np = strdup(to);
-        } else if (path_has_prefix(p, from)) {
-            size_t tlen = strlen(to);
-            size_t slen = strlen(p + fl);
-            np = malloc(tlen + slen + 1);
-            if (np) {
-                memcpy(np, to, tlen);
-                memcpy(np + tlen, p + fl, slen + 1);
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        xa_ent_t **pp = &g_xa_buckets[i];
+        while (*pp) {
+            xa_ent_t *e = *pp;
+            const char *p = e->path;
+            char       *np = NULL;
+            if (strcmp(p, from) == 0) {
+                np = strdup(to);
+            } else if (path_has_prefix(p, from)) {
+                size_t tlen = strlen(to);
+                size_t slen = strlen(p + fl);
+                np = malloc(tlen + slen + 1);
+                if (np) {
+                    memcpy(np, to, tlen);
+                    memcpy(np + tlen, p + fl, slen + 1);
+                }
             }
-        }
-        if (np) {
-            free(e->path);
-            e->path = np;
+            if (np) {
+                free(e->path);
+                e->path = np;
+                /* Rehash since path changed */
+                e->path_hash = xa_hash(e->path, e->name);
+            } else {
+                pp = &(*pp)->next;
+            }
         }
     }
     pthread_mutex_unlock(&g_xa_mu);
@@ -382,20 +453,22 @@ static void xa_purge_path(const char *path, int is_dir)
 {
     size_t L = strlen(path);
     pthread_mutex_lock(&g_xa_mu);
-    xa_ent_t **pp = &g_xa;
-    while (*pp) {
-        int drop = 0;
-        if (strcmp((*pp)->path, path) == 0)
-            drop = 1;
-        else if (is_dir && L > 0 && strncmp((*pp)->path, path, L) == 0 &&
-                 (*pp)->path[L] == '/')
-            drop = 1;
-        if (drop) {
-            xa_ent_t *d = *pp;
-            *pp = d->next;
-            xa_free_ent(d);
-        } else {
-            pp = &(*pp)->next;
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        xa_ent_t **pp = &g_xa_buckets[i];
+        while (*pp) {
+            xa_ent_t *e = *pp;
+            int drop = 0;
+            if (strcmp(e->path, path) == 0)
+                drop = 1;
+            else if (is_dir && L > 0 && strncmp(e->path, path, L) == 0 &&
+                     e->path[L] == '/')
+                drop = 1;
+            if (drop) {
+                *pp = e->next;
+                xa_free_ent(e);
+            } else {
+                pp = &(*pp)->next;
+            }
         }
     }
     pthread_mutex_unlock(&g_xa_mu);
@@ -408,9 +481,10 @@ static int xa_get(const char *path, const char *name, char *value, size_t size,
     if (!name)
         return -EINVAL;
     pthread_mutex_lock(&g_xa_mu);
+    uint32_t h = xa_hash(path, name);
     xa_ent_t *found = NULL;
-    for (xa_ent_t *e = g_xa; e; e = e->next) {
-        if (strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+    for (xa_ent_t *e = g_xa_buckets[h & (XA_BUCKET_COUNT - 1)]; e; e = e->next) {
+        if (e->path_hash == h && strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
             found = e;
             break;
         }
@@ -456,11 +530,13 @@ static int xa_set(const char *path, const char *name, const char *value,
     }
 #endif
     pthread_mutex_lock(&g_xa_mu);
-    xa_ent_t **slot = &g_xa;
+    uint32_t h = xa_hash(path, name);
+    xa_ent_t **slot = &g_xa_buckets[h & (XA_BUCKET_COUNT - 1)];
     xa_ent_t  *found = NULL;
     while (*slot) {
-        if (strcmp((*slot)->path, path) == 0 && strcmp((*slot)->name, name) == 0) {
-            found = *slot;
+        xa_ent_t *e = *slot;
+        if (e->path_hash == h && strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+            found = e;
             break;
         }
         slot = &(*slot)->next;
@@ -523,6 +599,7 @@ static int xa_set(const char *path, const char *name, const char *value,
         pthread_mutex_unlock(&g_xa_mu);
         return -ENOMEM;
     }
+    ne->path_hash = xa_hash(path, name);
     if (need > 0) {
         ne->val = calloc(1, need);
         if (!ne->val) {
@@ -534,8 +611,10 @@ static int xa_set(const char *path, const char *name, const char *value,
             memcpy(ne->val + (size_t)position, value, size);
         ne->vlen = need;
     }
-    ne->next = g_xa;
-    g_xa = ne;
+    /* Add to hash bucket */
+    uint32_t bucket = ne->path_hash & (XA_BUCKET_COUNT - 1);
+    ne->next = g_xa_buckets[bucket];
+    g_xa_buckets[bucket] = ne;
     pthread_mutex_unlock(&g_xa_mu);
     return 0;
 }
@@ -544,10 +623,12 @@ static int xa_list(const char *path, char *list, size_t size)
 {
     pthread_mutex_lock(&g_xa_mu);
     size_t need = 0;
-    for (xa_ent_t *e = g_xa; e; e = e->next) {
-        if (strcmp(e->path, path) != 0)
-            continue;
-        need += strlen(e->name) + 1;
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        for (xa_ent_t *e = g_xa_buckets[i]; e; e = e->next) {
+            if (strcmp(e->path, path) != 0)
+                continue;
+            need += strlen(e->name) + 1;
+        }
     }
     if (size == 0) {
         pthread_mutex_unlock(&g_xa_mu);
@@ -558,12 +639,14 @@ static int xa_list(const char *path, char *list, size_t size)
         return -ERANGE;
     }
     char *p = list;
-    for (xa_ent_t *e = g_xa; e; e = e->next) {
-        if (strcmp(e->path, path) != 0)
-            continue;
-        size_t nl = strlen(e->name) + 1;
-        memcpy(p, e->name, nl);
-        p += nl;
+    for (int i = 0; i < XA_BUCKET_COUNT; i++) {
+        for (xa_ent_t *e = g_xa_buckets[i]; e; e = e->next) {
+            if (strcmp(e->path, path) != 0)
+                continue;
+            size_t nl = strlen(e->name) + 1;
+            memcpy(p, e->name, nl);
+            p += nl;
+        }
     }
     pthread_mutex_unlock(&g_xa_mu);
     return (int)need;
@@ -574,8 +657,9 @@ static int xa_has_xattr(const char *path, const char *name)
     if (!path || !name)
         return 0;
     pthread_mutex_lock(&g_xa_mu);
-    for (xa_ent_t *e = g_xa; e; e = e->next) {
-        if (strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+    uint32_t h = xa_hash(path, name);
+    for (xa_ent_t *e = g_xa_buckets[h & (XA_BUCKET_COUNT - 1)]; e; e = e->next) {
+        if (e->path_hash == h && strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
             pthread_mutex_unlock(&g_xa_mu);
             return 1;
         }
@@ -587,12 +671,13 @@ static int xa_has_xattr(const char *path, const char *name)
 static int xa_remove_one(const char *path, const char *name)
 {
     pthread_mutex_lock(&g_xa_mu);
-    xa_ent_t **pp = &g_xa;
+    uint32_t h = xa_hash(path, name);
+    xa_ent_t **pp = &g_xa_buckets[h & (XA_BUCKET_COUNT - 1)];
     while (*pp) {
-        if (strcmp((*pp)->path, path) == 0 && strcmp((*pp)->name, name) == 0) {
-            xa_ent_t *d = *pp;
-            *pp = d->next;
-            xa_free_ent(d);
+        xa_ent_t *e = *pp;
+        if (e->path_hash == h && strcmp(e->path, path) == 0 && strcmp(e->name, name) == 0) {
+            *pp = e->next;
+            xa_free_ent(e);
             pthread_mutex_unlock(&g_xa_mu);
             return 0;
         }
@@ -802,8 +887,11 @@ static int op_open(const char *path, struct fuse_file_info *fi)
     h->object_id = s.object_id;
     h->remote_size = s.size;
     h->use_partial = 0;
+    uint64_t prefetch_max = path_use_full_mtp_fetch(path)
+        ? MTP_OP_OPEN_MEDIA_PREFETCH_MAX
+        : MTP_OP_OPEN_PREFETCH_MAX;
     int acc = fi->flags & O_ACCMODE;
-    if (!(fi->flags & O_TRUNC) && s.object_id && s.size > MTP_OP_OPEN_PREFETCH_MAX &&
+    if (!(fi->flags & O_TRUNC) && s.object_id && s.size > prefetch_max &&
         (acc == O_RDONLY || acc == O_RDWR) && mtp_supports_partial_read())
         h->use_partial = 1;
 
@@ -811,7 +899,7 @@ static int op_open(const char *path, struct fuse_file_info *fi)
     h->cache_ready = 0;
     /* Pull device payload once into staging fd (not for giants). */
     if (!h->use_partial && (fi->flags & O_ACCMODE) != O_WRONLY && s.size > 0 &&
-        s.size <= MTP_OP_OPEN_PREFETCH_MAX) {
+        s.size <= prefetch_max) {
         int st = mtp_download_to_fd(h->path, h->fd);
         if (st != 0) {
             close(h->fd); free(h->path); free(h); return st;
@@ -827,9 +915,9 @@ static int op_open(const char *path, struct fuse_file_info *fi)
         h->use_partial = 0;
     }
     fi->fh = (uint64_t)(uintptr_t)h;
-    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch=%d partial=%d cache_ready=%d %.2fms",
-                  path, fi->flags, (unsigned long long)s.size, did_prefetch,
-                  h->use_partial, h->cache_ready, fuse_mono_ms() - t0);
+    mtp_debug_log("fuse open path=%s flags=0x%x size=%llu prefetch_max=%llu prefetch=%d partial=%d cache_ready=%d %.2fms",
+                  path, fi->flags, (unsigned long long)s.size, (unsigned long long)prefetch_max,
+                  did_prefetch, h->use_partial, h->cache_ready, fuse_mono_ms() - t0);
     return 0;
 }
 
@@ -1361,6 +1449,23 @@ static void op_destroy(void *userdata)
 #if defined(__APPLE__)
     g_mtpfuse_remote_inval_stop = 1;
     g_mtpfuse_handle = NULL;
+#endif
+}
+
+/* Send an immediate invalidation pulse to Finder for the given path.
+ * This is called after a transfer completes to refresh any folders that
+ * might have been blocked during the transfer. */
+void mtp_invalidate_fuse_path(const char *path)
+{
+#if defined(__APPLE__)
+    if (!path || path[0] != '/')
+        return;
+    struct fuse *f = g_mtpfuse_handle;
+    if (!f)
+        return;
+    int ir = fuse_invalidate_path(f, path);
+    if (ir < 0 && ir != -ENOENT)
+        mtp_debug_log("fuse_invalidate_path(%s) rc=%d", path, ir);
 #endif
 }
 

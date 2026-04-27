@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,6 +72,28 @@ static pthread_mutex_t     g_lock   = PTHREAD_MUTEX_INITIALIZER;
  * take g_lock before g_mtp when both are needed (see mtp_close). */
 static pthread_mutex_t     g_mtp    = PTHREAD_MUTEX_INITIALIZER;
 
+/* Non-zero while a multi-GB Send_File / Get_File holds g_mtp. Cheap UI ops
+ * (getattr metadata refresh, statfs storage refresh) check this and fall back
+ * to cached values instead of queuing behind the transfer — that queueing is
+ * what froze Finder for the entire copy. The flag is purely advisory; libmtp
+ * is still serialized by g_mtp. */
+static atomic_int g_mtp_long_xfer;
+
+static inline void mtp_long_xfer_begin(void)
+{
+    atomic_fetch_add_explicit(&g_mtp_long_xfer, 1, memory_order_acq_rel);
+}
+
+static inline void mtp_long_xfer_end(void)
+{
+    atomic_fetch_sub_explicit(&g_mtp_long_xfer, 1, memory_order_acq_rel);
+}
+
+static inline int mtp_long_xfer_active(void)
+{
+    return atomic_load_explicit(&g_mtp_long_xfer, memory_order_acquire) > 0;
+}
+
 /* -1 = unknown, 0 = no, 1 = yes (LIBMTP_DEVICECAP_GetPartialObject). */
 static int g_cap_partial_get = -1;
 
@@ -78,7 +101,7 @@ static int g_cap_partial_get = -1;
 static const double k_mtp_storage_cache_ttl_sec = 4.0;
 /* Finder issues many getattrs; full Get_Filemetadata each time serializes on g_mtp and freezes UI.
  * Reads/downloads always refresh separately. Override with MTP_STAT_META_TTL_SEC (0 = every stat). */
-static const double k_mtp_stat_meta_ttl_sec_default = 8.0;
+static const double k_mtp_stat_meta_ttl_sec_default = 60.0;
 
 static pthread_cond_t  g_dir_load_cv = PTHREAD_COND_INITIALIZER;
 /* Async folder listing runs Get_Children + metadata without g_lock so Finder can
@@ -98,6 +121,10 @@ typedef struct {
 static mtp_stor_snap_t g_st_cache[64];
 static size_t          g_st_cache_n;
 static double          g_st_cache_mono = -1e9;
+/* Lightweight mutex held only while reading/writing the storage snapshot
+ * itself. Cache writers also hold g_mtp (libmtp serialization); cache
+ * readers take only this so statfs never queues behind a long transfer. */
+static pthread_mutex_t g_st_cache_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void log_mtp_errors(void);
 static double now_sec(void);
@@ -123,14 +150,29 @@ int mtp_anon_tempfile_fd(const char *stem)
 }
 
 /* USB MTP stacks often flake with a single NAK; Finder maps hard I/O failure
- * to “The device disappeared.” Multi-level retries cover long full-file pulls. */
+ * to “The device disappeared.” Multi-level retries cover long full-file pulls.
+ *
+ * Two retry budgets:
+ *   • Short ops (Get_Children, Get_Filemetadata, Delete_Object, Set_Filename,
+ *     Move_Object): can afford up to MTP_USB_RETRIES because each attempt is
+ *     fast (sub-second).
+ *   • Big transfers (Get_File_To_FD, Send_File_From_FD): ONE attempt may take
+ *     minutes and holds g_mtp the whole time. Anything queued behind it is
+ *     blocked. So we cap inner retries hard and lean on outer-wave restarts
+ *     instead — that returns control between waves so other UI ops (statfs,
+ *     stat, readdir of new folders) can squeeze in. */
 enum {
-    /* Inner attempts per libmtp call (NAK / brief stall). */
+    /* Inner attempts per short libmtp call (NAK / brief stall). */
     MTP_USB_RETRIES = 16,
-    /* Full download restarts after inner retries exhaust (big files often fail near EOF). */
-    MTP_DOWNLOAD_OUTER_WAVES = 6,
-    /* Full upload restarts after send or post-send verify fails (truncated object on device). */
-    MTP_SEND_OUTER_WAVES = 5,
+    /* Per-call retries for full-file Get_File / Send_File.
+     * Reduced from 3 to 2 to prevent retry storms. */
+    MTP_USB_TRANSFER_RETRIES = 2,
+    /* Full download restarts (large files often fail near EOF).
+     * Reduced from 3 to 2 to prevent retry storms. */
+    MTP_DOWNLOAD_OUTER_WAVES = 2,
+    /* Full upload restarts after send or post-send verify fails.
+     * Reduced from 3 to 2 to prevent retry storms. */
+    MTP_SEND_OUTER_WAVES = 2,
 };
 
 static void mtp_usb_backoff(unsigned attempt_1based)
@@ -148,25 +190,40 @@ static void mtp_usb_backoff(unsigned attempt_1based)
     usleep(ms * 1000u);
 }
 
+/* Bounded backoff for transfer retries — caps at 1s so a single bad transfer
+ * cannot hold g_mtp for tens of seconds between attempts. */
+static void mtp_usb_transfer_backoff(unsigned attempt_1based)
+{
+    if (attempt_1based == 0)
+        return;
+    unsigned ms = 125u * (attempt_1based > 8u ? 8u : attempt_1based);
+    if (ms > 1000u)
+        ms = 1000u;
+    usleep(ms * 1000u);
+}
+
 /* Returns 0, -ENODEV, or -1 (caller maps -1 → -EIO). Resets [fd] to empty + offset 0 between tries. */
 static int mtp_get_file_to_fd_retry(uint32_t oid, int fd)
 {
     int last = -1;
-    for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+    for (unsigned k = 0; k < (unsigned)MTP_USB_TRANSFER_RETRIES; k++) {
         if (k > 0) {
-            mtp_usb_backoff((unsigned)k);
+            mtp_usb_transfer_backoff((unsigned)k);
             if (ftruncate(fd, 0) < 0)
                 return -errno;
             if (lseek(fd, 0, SEEK_SET) < 0)
                 return -errno;
         }
+        mtp_long_xfer_begin();
         pthread_mutex_lock(&g_mtp);
         if (!g_device) {
             pthread_mutex_unlock(&g_mtp);
+            mtp_long_xfer_end();
             return -ENODEV;
         }
         last = LIBMTP_Get_File_To_File_Descriptor(g_device, oid, fd, NULL, NULL);
         pthread_mutex_unlock(&g_mtp);
+        mtp_long_xfer_end();
         if (last == 0)
             return 0;
         log_mtp_errors();
@@ -222,18 +279,21 @@ static int mtp_get_oid_to_fd_full_retry(uint32_t oid, int fd, uint64_t expect_sz
 static int mtp_send_file_from_fd_retry(LIBMTP_file_t *meta, int fd)
 {
     int last = -1;
-    for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
+    for (unsigned k = 0; k < (unsigned)MTP_USB_TRANSFER_RETRIES; k++) {
         if (k > 0)
-            mtp_usb_backoff((unsigned)k);
+            mtp_usb_transfer_backoff((unsigned)k);
         if (lseek(fd, 0, SEEK_SET) < 0)
             return -errno;
+        mtp_long_xfer_begin();
         pthread_mutex_lock(&g_mtp);
         if (!g_device) {
             pthread_mutex_unlock(&g_mtp);
+            mtp_long_xfer_end();
             return -ENODEV;
         }
         last = LIBMTP_Send_File_From_File_Descriptor(g_device, fd, meta, NULL, NULL);
         pthread_mutex_unlock(&g_mtp);
+        mtp_long_xfer_end();
         if (last == 0)
             return 0;
         log_mtp_errors();
@@ -266,6 +326,7 @@ static int mtp_delete_object_retry(uint32_t oid)
 /* File metadata refresh must not run mtp_usb_backoff() while holding g_lock:
  * Finder would freeze for the whole mount until USB retries finish. */
 static mtp_node_t *resolve(const char *path);
+static mtp_node_t *resolve_cached(const char *path, int load_children_flag);
 
 static double stat_meta_ttl_sec(void)
 {
@@ -513,10 +574,13 @@ static double now_sec(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+/* Caller holds g_mtp. Also takes g_st_cache_mu for the read-side. */
 static void storage_cache_invalidate_unlocked(void)
 {
+    pthread_mutex_lock(&g_st_cache_mu);
     g_st_cache_n = 0;
     g_st_cache_mono = -1e9;
+    pthread_mutex_unlock(&g_st_cache_mu);
 }
 
 /* Precondition: g_mtp held. */
@@ -528,15 +592,21 @@ static int storage_cache_ensure_fresh_unlocked(void)
     if (g_st_cache_n > 0 && (now - g_st_cache_mono) < k_mtp_storage_cache_ttl_sec)
         return 0;
     LIBMTP_Get_Storage(g_device, LIBMTP_STORAGE_SORTBY_NOTSORTED);
-    g_st_cache_n = 0;
+    mtp_stor_snap_t tmp[sizeof(g_st_cache) / sizeof(g_st_cache[0])];
+    size_t tmp_n = 0;
     for (LIBMTP_devicestorage_t *s = g_device->storage;
-         s && g_st_cache_n < sizeof(g_st_cache) / sizeof(g_st_cache[0]); s = s->next) {
-        g_st_cache[g_st_cache_n].id = s->id;
-        g_st_cache[g_st_cache_n].max_cap = s->MaxCapacity;
-        g_st_cache[g_st_cache_n].free_bytes = s->FreeSpaceInBytes;
-        g_st_cache_n++;
+         s && tmp_n < sizeof(tmp) / sizeof(tmp[0]); s = s->next) {
+        tmp[tmp_n].id = s->id;
+        tmp[tmp_n].max_cap = s->MaxCapacity;
+        tmp[tmp_n].free_bytes = s->FreeSpaceInBytes;
+        tmp_n++;
     }
+    pthread_mutex_lock(&g_st_cache_mu);
+    if (tmp_n)
+        memcpy(g_st_cache, tmp, tmp_n * sizeof(tmp[0]));
+    g_st_cache_n = tmp_n;
     g_st_cache_mono = now;
+    pthread_mutex_unlock(&g_st_cache_mu);
     return 0;
 }
 
@@ -777,7 +847,7 @@ static void load_children(mtp_node_t *dir)
     uint32_t gen_start = dir->load_gen;
     const char *dbg = dir->name ? dir->name : "?";
 
-    mtp_debug_log("[LOAD] \"%s\" sid=%u parent_id=0x%x → Get_Children + per-object metadata",
+    mtp_debug_log("[LOAD] \"%s\" sid=%u parent_id=0x%x → Get_Files_And_Folders (batch metadata)",
                   dbg, sid, pid);
     if (trace) {
         fprintf(stderr, "[LOAD] \"%s\" sid=%u parent_id=0x%x (MTP listing)…\n",
@@ -789,80 +859,82 @@ static void load_children(mtp_node_t *dir)
     if (async_ok)
         pthread_mutex_unlock(&g_lock);
 
-    uint32_t *ids = NULL;
+    LIBMTP_file_t *files = NULL;
     int nkids = -1;
     for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
         if (k > 0) {
             mtp_usb_backoff((unsigned)k);
-            free(ids);
-            ids = NULL;
+            if (files) {
+                LIBMTP_destroy_file_t(files);
+                files = NULL;
+            }
         }
         pthread_mutex_lock(&g_mtp);
         if (!g_device) {
             pthread_mutex_unlock(&g_mtp);
-            free(ids);
-            ids = NULL;
+            if (files) {
+                LIBMTP_destroy_file_t(files);
+                files = NULL;
+            }
             nkids = -1;
             break;
         }
-        nkids = LIBMTP_Get_Children(g_device, sid, pid, &ids);
+        files = LIBMTP_Get_Files_And_Folders(g_device, sid, pid);
         pthread_mutex_unlock(&g_mtp);
-        if (nkids >= 0)
+        if (files) {
+            /* Count entries by traversing the linked list */
+            nkids = 0;
+            LIBMTP_file_t *tmp = files;
+            while (tmp) {
+                nkids++;
+                tmp = tmp->next;
+            }
             break;
+        }
         log_mtp_errors();
     }
 
-    mtp_debug_log("[LOAD] \"%s\" Get_Children → n=%d elapsed %.3fs",
+    mtp_debug_log("[LOAD] \"%s\" Get_Files_And_Folders → n=%d elapsed %.3fs",
                   dbg, nkids, now_sec() - t0);
 
     mtp_node_t *built = NULL;
     int count = 0;
     int meta_aborted = 0;
 
-    if (nkids > 0) {
-        for (int i = 0; i < nkids; i++) {
-            pthread_mutex_lock(&g_mtp);
-            if (!g_device) {
-                pthread_mutex_unlock(&g_mtp);
-                meta_aborted = 1;
-                break;
-            }
-            LIBMTP_file_t *file = LIBMTP_Get_Filemetadata(g_device, ids[i]);
-            pthread_mutex_unlock(&g_mtp);
-
-            if (file) {
-                int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
-                if (file->filename && file->filename[0] &&
-                    !(mtp_skip_hidden_dot_filenames() && file->filename[0] == '.')) {
-                    mtp_node_t *n = node_new(file->filename, is_dir,
-                                             file->item_id, file->storage_id);
-                    if (n) {
-                        n->size  = file->filesize;
-                        n->mtime = file->modificationdate;
-                        if (!is_dir)
-                            n->meta_cached_at = now_sec();
-                        n->next_sibling = built;
-                        built = n;
-                        count++;
-                        if (trace && (count % 200) == 0) {
-                            mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
-                                          dbg, count, now_sec() - t0);
-                            fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
-                            fflush(stderr);
-                        } else if ((count % 200) == 0) {
-                            mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
-                                          dbg, count, now_sec() - t0);
-                        }
+    if (nkids > 0 && files) {
+        LIBMTP_file_t *file = files;
+        while (file) {
+            int is_dir = (file->filetype == LIBMTP_FILETYPE_FOLDER);
+            if (file->filename && file->filename[0] &&
+                !(mtp_skip_hidden_dot_filenames() && file->filename[0] == '.')) {
+                mtp_node_t *n = node_new(file->filename, is_dir,
+                                         file->item_id, file->storage_id);
+                if (n) {
+                    n->size  = file->filesize;
+                    n->mtime = file->modificationdate;
+                    if (!is_dir)
+                        n->meta_cached_at = now_sec();
+                    n->next_sibling = built;
+                    built = n;
+                    count++;
+                    if (trace && (count % 200) == 0) {
+                        mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
+                                      dbg, count, now_sec() - t0);
+                        fprintf(stderr, "[LOAD] \"%s\" … %d entries so far\n", dbg, count);
+                        fflush(stderr);
+                    } else if ((count % 200) == 0) {
+                        mtp_debug_log("[LOAD] \"%s\" … %d entries (%.3fs)",
+                                      dbg, count, now_sec() - t0);
                     }
                 }
-                LIBMTP_destroy_file_t(file);
             }
+            file = file->next;
         }
     }
 
-    if (ids) {
-        free(ids);
-        ids = NULL;
+    if (files) {
+        LIBMTP_destroy_file_t(files);
+        files = NULL;
     }
 
     mtp_node_t *dir_target = dir;
@@ -1018,19 +1090,28 @@ static void mtp_synth_attach_volume_meta(mtp_node_t *vol)
  * Call only while holding g_lock (load_children keeps the lock). */
 static mtp_node_t *resolve(const char *path)
 {
+    return resolve_cached(path, 1);
+}
+
+/* resolve_cached: if load_children == 1, load as needed (slow path).
+ * If load_children == 0, return cached node or NULL (fast getattr path). */
+static mtp_node_t *resolve_cached(const char *path, int load_children_flag)
+{
     if (!path || path[0] != '/') return NULL;
     if (strlen(path) >= PATH_MAX) return NULL;
     if (path[1] == '\0') return g_root;
 
     mtp_node_t *cur = g_root;
-    load_children(cur);
+    if (load_children_flag)
+        load_children(cur);
 
     char *dup = strdup(path + 1);
     if (!dup) return NULL;
 
     char *save = NULL;
     for (char *tok = strtok_r(dup, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
-        load_children(cur);
+        if (load_children_flag)
+            load_children(cur);
         mtp_node_t *child = node_find_child(cur, tok);
         if (!child) {
 #if defined(__APPLE__)
@@ -1357,38 +1438,57 @@ int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t
     }
     pthread_mutex_unlock(&g_lock);
 
-    pthread_mutex_lock(&g_mtp);
-    if (!g_device) {
-        pthread_mutex_unlock(&g_mtp);
-        return have_node ? -ENODEV : -ENOENT;
+    /* During a multi-GB Send_File / Get_File g_mtp is pinned for the whole
+     * transfer; blocking statfs there is what froze Finder. Read the snapshot
+     * under its own short-held mutex (g_st_cache_mu), only reaching for
+     * g_mtp to actually refresh the cache, and skip the refresh entirely
+     * while a transfer is active. */
+    int refreshed = 0;
+    if (!mtp_long_xfer_active()) {
+        if (pthread_mutex_trylock(&g_mtp) == 0) {
+            if (!g_device) {
+                pthread_mutex_unlock(&g_mtp);
+                return have_node ? -ENODEV : -ENOENT;
+            }
+            (void)storage_cache_ensure_fresh_unlocked();
+            pthread_mutex_unlock(&g_mtp);
+            refreshed = 1;
+        }
     }
-    if (storage_cache_ensure_fresh_unlocked() != 0) {
-        pthread_mutex_unlock(&g_mtp);
+
+    mtp_stor_snap_t snap[64];
+    size_t snap_n = 0;
+    pthread_mutex_lock(&g_st_cache_mu);
+    snap_n = g_st_cache_n;
+    if (snap_n > sizeof(snap) / sizeof(snap[0]))
+        snap_n = sizeof(snap) / sizeof(snap[0]);
+    if (snap_n)
+        memcpy(snap, g_st_cache, snap_n * sizeof(snap[0]));
+    pthread_mutex_unlock(&g_st_cache_mu);
+    (void)refreshed;
+
+    if (snap_n == 0)
         return have_node ? -ENODEV : -ENOENT;
-    }
 
     uint64_t tot = 0, fr = 0;
     if (want_sid == 0u) {
-        for (size_t i = 0; i < g_st_cache_n; i++) {
-            tot += g_st_cache[i].max_cap;
-            fr += g_st_cache[i].free_bytes;
+        for (size_t i = 0; i < snap_n; i++) {
+            tot += snap[i].max_cap;
+            fr += snap[i].free_bytes;
         }
     } else {
         int found = 0;
-        for (size_t i = 0; i < g_st_cache_n; i++) {
-            if (g_st_cache[i].id == want_sid) {
-                tot = g_st_cache[i].max_cap;
-                fr = g_st_cache[i].free_bytes;
+        for (size_t i = 0; i < snap_n; i++) {
+            if (snap[i].id == want_sid) {
+                tot = snap[i].max_cap;
+                fr = snap[i].free_bytes;
                 found = 1;
                 break;
             }
         }
-        if (!found) {
-            pthread_mutex_unlock(&g_mtp);
+        if (!found)
             return -ENOENT;
-        }
     }
-    pthread_mutex_unlock(&g_mtp);
 
     if (fr > tot)
         fr = tot;
@@ -1448,7 +1548,8 @@ static int mtp_stat_impl(const char *path, mtp_stat_t *out, int force_meta_refre
     char norm_buf[PATH_MAX];
     const char *path_use = mtp_path_for_tree(path, norm_buf, sizeof norm_buf);
     pthread_mutex_lock(&g_lock);
-    mtp_node_t *n = resolve(path_use);
+    /* Finder getattr hammers us; use fast cached-only resolve to avoid blocking on load_children. */
+    mtp_node_t *n = resolve_cached(path_use, 0);
     int rc = -ENOENT;
     if (n) {
         int is_real_file = (!n->is_synth && !n->is_dir && n->object_id != 0u);
@@ -1461,11 +1562,26 @@ static int mtp_stat_impl(const char *path, mtp_stat_t *out, int force_meta_refre
                 need_meta = (ttl <= 0.0) || (n->meta_cached_at <= 0.0) ||
                             ((now_sec() - n->meta_cached_at) >= ttl);
             }
+            /* Don't queue a Get_Filemetadata behind an in-flight multi-GB
+             * Send_File / Get_File: that's the Finder freeze. Cached values
+             * stay accurate for the duration of the transfer. force_meta_refresh
+             * (mtp_stat_refresh) still wins — it's only used by op_open and
+             * download paths that genuinely need the on-device size. */
+            if (need_meta && !force_meta_refresh && n->meta_cached_at > 0.0 &&
+                mtp_long_xfer_active())
+                need_meta = 0;
         }
         if (need_meta) {
             pthread_mutex_unlock(&g_lock);
-            if (refresh_file_meta_for_path(path_use) != 0)
+            /* For force_meta_refresh during a long transfer, trylock first to avoid blocking.
+             * If the transfer holds g_mtp, fall back to cached values instead of waiting. */
+            int long_xfer_active = mtp_long_xfer_active();
+            if (force_meta_refresh && long_xfer_active && n->meta_cached_at > 0.0) {
+                /* Use cached values instead of blocking on the transfer. */
+                need_meta = 0;
+            } else if (refresh_file_meta_for_path(path_use) != 0) {
                 return -EIO;
+            }
             pthread_mutex_lock(&g_lock);
             n = resolve(path_use);
             if (!n) {
@@ -1610,52 +1726,6 @@ int mtp_supports_partial_read(void)
     return g_cap_partial_get;
 }
 
-/* Walk forward with GetPartialObject from [known_min] until no more bytes.
- * ObjectCompressedSize often under-reports MP4/MOV; without this, Finder copies stop short
- * (e.g. 69 MiB of 74 MiB) and sit in "copying" forever. */
-static uint64_t mtp_discover_object_eof_via_partial(uint32_t oid, uint64_t known_min)
-{
-    if (oid == 0u)
-        return known_min;
-    const uint32_t chunk = 2097152u;
-    uint64_t hi = known_min;
-
-    for (;;) {
-        unsigned char *data = NULL;
-        unsigned int got = 0;
-        int chunk_ok = 0;
-        for (unsigned k = 0; k < (unsigned)MTP_USB_RETRIES; k++) {
-            if (k > 0)
-                mtp_usb_backoff((unsigned)k);
-            pthread_mutex_lock(&g_mtp);
-            if (!g_device) {
-                pthread_mutex_unlock(&g_mtp);
-                return known_min;
-            }
-            int last = LIBMTP_GetPartialObject(g_device, oid, hi, chunk, &data, &got);
-            pthread_mutex_unlock(&g_mtp);
-            if (last == 0 && data && got > 0u) {
-                if (got > chunk)
-                    got = chunk;
-                chunk_ok = 1;
-                break;
-            }
-            if (data) {
-                free(data);
-                data = NULL;
-            }
-            log_mtp_errors();
-        }
-        if (!chunk_ok)
-            break;
-        hi += (uint64_t)got;
-        free(data);
-        if (got < chunk)
-            break;
-    }
-    return hi;
-}
-
 int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
                      off_t offset)
 {
@@ -1748,25 +1818,11 @@ int mtp_read(const char *path, char *buf, size_t size, off_t offset)
     uint64_t total = n->size;
     pthread_mutex_unlock(&g_lock);
 
-    if ((uint64_t)offset >= total) {
-        if (!mtp_supports_partial_read())
-            return 0;
-        uint64_t ext = mtp_discover_object_eof_via_partial(oid, total);
-        if (ext > total) {
-            mtp_debug_log("mtp_read extend oid=%u metadata_sz=%llu discovered=%llu",
-                          oid, (unsigned long long)total, (unsigned long long)ext);
-            pthread_mutex_lock(&g_lock);
-            n = resolve(path_use);
-            if (n && n->object_id == oid && n->size < ext) {
-                n->size = ext;
-                n->meta_cached_at = now_sec();
-            }
-            total = ext;
-            pthread_mutex_unlock(&g_lock);
-        }
-        if ((uint64_t)offset >= total)
-            return 0;
-    }
+    /* Bound reads by refreshed metadata. Media opens should use full-object prefetch in
+     * fs_ops (Get_File) so length matches bytes on wire; probing past metadata via
+     * GetPartialObject can append garbage on some devices and corrupt duplicates. */
+    if ((uint64_t)offset >= total)
+        return 0;
     if (offset + size > total) size = (size_t)(total - offset);
 
     mtp_debug_log("mtp_read begin path=%s oid=%u off=%lld sz=%zu file_sz=%llu",
@@ -2238,6 +2294,9 @@ static int mtp_write_send_fd(const char *path, int fd, size_t size)
 
         mtp_storage_cache_bust();
         free(path_dup);
+        /* Kick Finder invalidation pulse for parent directory so any blocked
+         * folders are refreshed immediately rather than waiting up to 60s. */
+        mtp_invalidate_fuse_path(parent_path);
         mtp_debug_log("mtp_write_send_fd: success");
         return 0;
     }
@@ -2482,7 +2541,11 @@ int mtp_rename(const char *from, const char *to)
     if (cross_dir_move) {
         free(fpath);
         free(tpath);
-        mtp_refresh_tree();
+        /* Targeted invalidation instead of nuking the entire tree.
+         * Source parent: file/dir moved out. Destination parent: new item added. */
+        mtp_invalidate_fuse_dir_cache(fparent_s);
+        if (strcmp(fparent_s, tparent_s) != 0)
+            mtp_invalidate_fuse_dir_cache(tparent_s);
         return 0;
     }
 
