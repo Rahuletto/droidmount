@@ -1,7 +1,7 @@
 #ifndef MTP_BRIDGE_H
 #define MTP_BRIDGE_H
 
-#include "mtp_debug.h"
+#include "mtp_log.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -11,46 +11,28 @@
 extern "C" {
 #endif
 
-/* Initialise libmtp and pick the first attached MTP device.
- * Returns 0 on success, -1 on failure. */
 int  mtp_open(void);
 void mtp_close(void);
-
-/* Host path passed to mtpfuse as the mount point (same string as fuse_main).
- * macOS statfs can pass the full host path; we strip this prefix so paths
- * match the in-mount tree and per-storage totals are correct. */
 void mtp_set_fuse_mount_point(const char *mountpoint);
-
-/* Anonymous disk staging file under TMPDIR (unlinked immediately). Returns fd or -errno. */
 int mtp_anon_tempfile_fd(const char *stem);
-
-/* Walk the entire device tree once and populate the id<->path cache.
- * Safe to call multiple times — refreshes the cache. */
 int  mtp_refresh_tree(void);
-
-/* Path-oriented helpers used by the FUSE layer.
- * All paths are absolute and start with "/". The first component is the
- * storage name (e.g. "/Internal storage/DCIM/IMG_0001.jpg").
- * After mtp_set_fuse_mount_point(), a full host path under that mount is
- * accepted too (macOS may pass it for some VFS ops). */
 
 typedef struct {
     int      is_dir;
+    int      is_shell;
     uint64_t size;
     uint64_t mtime;
-    uint32_t object_id;   /* 0 = synthetic storage volume node */
+    uint32_t object_id;
     uint32_t storage_id;
 } mtp_stat_t;
 
 int  mtp_stat(const char *path, mtp_stat_t *out);
-/* Like mtp_stat but always syncs file size/mtime from the device (open, rename checks). */
 int  mtp_stat_refresh(const char *path, mtp_stat_t *out);
 
-/* One directory level from cache (after MTP fetch for that folder only).
- * Snapshot is malloc'd; free with mtp_readdir_snapshot_free. */
 typedef struct {
     char    *name;
     int      is_dir;
+    int      is_shell;
     uint64_t size;
     uint64_t mtime;
     uint32_t object_id;
@@ -59,57 +41,24 @@ typedef struct {
 
 int  mtp_readdir_snapshot(const char *path, mtp_dirent_t **out, size_t *n_out);
 void mtp_readdir_snapshot_free(mtp_dirent_t *entries, size_t n);
-
-/* Read [size] bytes at [offset] from the file at [path] into [buf].
- * Returns bytes read or -errno. */
 int  mtp_read(const char *path, char *buf, size_t size, off_t offset);
-
-/* 1 if the device reports LIBMTP_DEVICECAP_GetPartialObject (cached). */
+int mtp_long_transfer_active(void);
 int mtp_supports_partial_read(void);
-
-/* Range read via GetPartialObject (no full-file pull). [oid] and [file_size]
- * must match the object opened from the tree. Returns bytes read or -errno. */
 int mtp_read_partial(uint32_t oid, uint64_t file_size, char *buf, size_t size,
                      off_t offset);
-
-/* Pull the full object from the device into [fd] (truncated, seek 0). For
- * large files when op_open skips prefetch. Returns 0 or -errno. */
 int  mtp_download_to_fd(const char *path, int fd);
-
-/* Replace the file at [path] with [size] bytes from [buf]. Creates the
- * file if it does not exist. Returns bytes written or -errno. */
 int  mtp_write_full(const char *path, const char *buf, size_t size);
-
-/* Same as mtp_write_full but reads payload from [fd] at offset 0 (after
- * optional internal lseek). Avoids malloc(filesize) on release. */
 int  mtp_write_full_fd(const char *path, int fd, size_t size);
-
-/* Rename or move within the device (MTP Set_Object_Filename / Move_Object). */
 int  mtp_rename(const char *from, const char *to);
-
-/* Unlink (delete) a file. */
 int  mtp_unlink(const char *path);
-
-/* mkdir / rmdir. */
 int  mtp_mkdir(const char *path);
 int  mtp_rmdir(const char *path);
-
-/* Free/total bytes for the storage volume containing `path` (from libmtp).
- * If `path` is `/` or cannot be resolved, sums all storages. Returns 0 or -errno.
- * After mtp_set_fuse_mount_point(), a full host path under that mount is
- * accepted (macOS statfs) so each storage volume gets its own totals. */
+int  mtp_shell_file_register(const char *path);
+void mtp_shell_file_unregister(const char *path);
 int mtp_storage_space_for_path(const char *path, uint64_t *total_bytes, uint64_t *free_bytes);
-
-/* Invoke [cb] with "/StorageName" for each top-level storage dir (not mount "/"). */
 void mtp_for_each_volume_directory_path(void (*cb)(const char *path, void *ctx), void *ctx);
-
-/* Drop cached children under this in-mount path; next readdir refetches from the device. */
 void mtp_invalidate_fuse_dir_cache(const char *fuse_path);
-
-/* macOS: send immediate invalidation pulse for path (called after transfers). */
 void mtp_invalidate_fuse_path(const char *path);
-
-/* macOS: 1 when MTP_VOLUME_ICON_PATH is set and readable (volume icon + root FinderInfo). */
 int mtp_root_volume_icon_active(void);
 
 #ifdef __cplusplus

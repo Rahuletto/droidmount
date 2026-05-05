@@ -36,8 +36,11 @@ From the directory that contains this `Makefile` (repository root):
 ```bash
 make check-deps     # verifies macFUSE + libmtp are reachable
 make                # builds build/AndroidMount.app
-make run            # same as: open build/AndroidMount.app
+make run            # rebuild bundle, kill AndroidMount/mtpfuse/Finder, open the app
+./scripts/run.sh    # clean + full build + open
 ```
+
+Use `ANDROIDMOUNT_SKIP_KILL=1 make run` to open without killing processes first.
 
 **Using it:** unlock the phone, set USB to **File Transfer / MTP**, then
 launch the app (or keep it running). When the menu shows **Connected**,
@@ -60,6 +63,11 @@ The Makefile compiles two binaries:
 
 Both are bundled into `build/AndroidMount.app`. The app finds the
 helper via `Bundle.main.bundleURL/Contents/MacOS/mtpfuse`.
+
+**Developers & coding agents:** see **`AGENTS.md`** (repo overview) and the
+project Cursor skill **`.cursor/skills/droidmount-mtp/SKILL.md`** (MTP/FUSE
+behavior, env vars, partial vs full reads, mutex rules). Update those when you
+change bridge or FUSE semantics.
 
 The build is **ad-hoc signed** (`codesign -s -`). No Apple Developer
 account is required, and Gatekeeper will allow the app on the machine
@@ -122,18 +130,29 @@ AndroidMount/
 
 ## Troubleshooting
 
-* **Finder stuck on “Loading…”** – while the mount is active, watch the trace
-  file (same PID as `mtpfuse`; stable symlink always points at the latest run):
+* **Action log (FUSE + MTP):** the menu-bar app sets `MTPFUSE_LOG=1` and
+  `MTPFUSE_LOG_PATH=~/.AndroidMount/mtpfuse.log` (append, session banners per
+  process). Each FUSE op is logged with `op=…`, `path=…`, `rc=`, and
+  `dt=…ms` (and `read`/`write` include size and offset). The bridge’s existing
+  `mtp_log` lines (MTP I/O) go to the same file when enabled. Watch live:
 
   ```bash
-  tail -f /tmp/mtpfuse-debug-latest.log
+  tail -F ~/.AndroidMount/mtpfuse.log
   ```
 
-  Lines are tagged with monotonic time and pthread id. Long gaps between
-  `readdir_snapshot ENTER` and `Get_Files_And_Folders returned` mean the
-  phone/USB is slow listing that folder; a flood of `fuse open` / `mtp_read`
-  means Finder is pulling whole files (previews). Disable file logging with
-  `MTPFUSE_DEBUG=0` in the environment if you do not want `/tmp/mtpfuse-*.log`.
+  A stable symlink is created at `/tmp/mtpfuse-debug-latest.log` when the log
+  file opens. Disable file logging: `MTPFUSE_LOG=0`. Enable from the shell
+  without the app: `MTPFUSE_LOG=1` and optionally
+  `MTPFUSE_LOG_PATH=~/.AndroidMount/mtpfuse.log` (same rules as
+  `MTPFUSE_DEBUG_LOG` for a custom path). `MTPFUSE_LOG_SYNC=1` flushes every
+  line (slower, safer if the process is killed). `MTPFUSE_DEBUG=1` also turns
+  logging on. Hot-path volume queries: if `statfs` lines are too noisy, we can
+  add a filter in a follow-up.
+
+* **Finder stuck on “Loading…”** – use the log above. Long gaps between
+  `readdir_snapshot` and `Get_Files_And_Folders` mean the phone or MTP listing
+  is slow for that folder; many `fuse op=read` / bridge `mtp_read` lines mean
+  Finder is reading data (e.g. previews).
 
 * **“Mount point is already in use”** – usually a leftover macFUSE mount after
   Finder or the app hung. On the next connect, the app **force-unmounts** that

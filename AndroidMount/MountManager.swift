@@ -36,6 +36,7 @@ final class MountManager {
 
     private var sessions: [UInt32: Session] = [:]
     private let sessionsLock = NSLock()
+    private let mountQueue = DispatchQueue(label: "local.androidmount.mount-queue", qos: .userInitiated)
     private var cachedMtpfusePath: String?
     private static var cachedVolIconPath: String?
 
@@ -102,7 +103,9 @@ final class MountManager {
     }
 
     func mount(device: USBDevice, completion: @escaping (Result<String, Error>) -> Void) {
-        startFuseMount(device: device, completion: completion)
+        mountQueue.async { [weak self] in
+            self?.startFuseMount(device: device, completion: completion)
+        }
     }
 
     private func startFuseMount(
@@ -138,10 +141,13 @@ final class MountManager {
         }
 
         let safeVol = Self.fuseVolumeLabel(deviceName: device.name)
+        // 1h timeouts made Finder folder listings look “stale” (file moved on device, UI lagged).
+        // 60s re-checks dentries more often; rename/upload also call fuse_invalidate_path. If
+        // navigation feels USB-heavy, raise toward 300–1200s.
         let fuseOpts =
             "local,defer_permissions,noappledouble,noatime," +
             "iosize=1048576,daemon_timeout=86400," +
-            "attr_timeout=3600,entry_timeout=3600,negative_timeout=3600" +
+            "attr_timeout=60,entry_timeout=60,negative_timeout=60" +
             ",volname=\(safeVol)"
 
         var argv: [String] = ["-f", "-o", fuseOpts]
@@ -158,13 +164,17 @@ final class MountManager {
         env["DYLD_FALLBACK_LIBRARY_PATH"] =
             "/opt/homebrew/lib:/usr/local/lib:/Library/Frameworks/macFUSE.framework/Versions/A:" +
             (env["DYLD_FALLBACK_LIBRARY_PATH"] ?? "")
-        env["MTP_USB_BUS_LOCATION"] = String(device.locationID)
+        env.removeValue(forKey: "MTP_USB_BUS_LOCATION")
+        env["MTP_USB_VENDOR_ID"] = String(format: "0x%04x", device.vendorID)
+        env["MTP_USB_PRODUCT_ID"] = String(format: "0x%04x", device.productID)
         env.removeValue(forKey: "ADB_SERIAL")
         env.removeValue(forKey: "ADB_DEVICE_PREFIX")
         env.removeValue(forKey: "MTP_HYBRID_ADB")
         if let ic = Self.resolvedDriveIcnsPath() {
             env["MTP_VOLUME_ICON_PATH"] = ic
         }
+        env["MTPFUSE_LOG"] = "1"
+        env["MTPFUSE_LOG_PATH"] = "\(NSHomeDirectory())/.AndroidMount/mtpfuse.log"
         p.environment = env
 
         let errPipe = Pipe()
@@ -233,13 +243,10 @@ final class MountManager {
                 for _ in 0..<40 {
                     Thread.sleep(forTimeInterval: 0.2)
                     if self.isFuseMounted(at: mountPoint) {
-                        if !self.verifyBrowsableVolume(at: mountPoint) {
-                            let msg =
-                                "No storage is visible yet — unlock the phone and set USB to File transfer (MTP). " +
-                                "If it already is, try unplugging and reconnecting."
-                            returnOnce(.failure(MountError.mountFailed(msg)))
-                            self.abortEphemeralFuseMount(process: p, mountPoint: mountPoint)
-                            return
+                        // Do not tear down just because storage is not immediately visible.
+                        // Some phones expose an empty root briefly before USB permission / MTP session settles.
+                        if !self.verifyBrowsableVolume(at: mountPoint, quick: true) {
+                            NSLog("MountManager: mounted but storage not visible yet at %@", mountPoint)
                         }
                         self.sessionsLock.lock()
                         self.sessions[device.locationID] =

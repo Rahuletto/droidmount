@@ -4,7 +4,9 @@
 #   make            → build mtpfuse helper + AndroidMount.app
 #   make mtpfuse    → C FUSE daemon only
 #   make app        → Swift menu-bar app only
-#   make run        → build & launch the app
+#   make run        → bundle, then scripts/run.sh --open-only
+#                     (kill AndroidMount + mtpfuse + Finder, then open app)
+#   scripts/run.sh  → make clean, full build, open (or --build for no open)
 #   make clean      → remove build/
 
 SHELL := /bin/bash
@@ -50,7 +52,7 @@ ICNS_FALLBACK := /System/Library/CoreServices/CoreTypes.bundle/Contents/Resource
 # NO_ASPECT_FILL_ICNS=1 copies the source .icns verbatim.
 PACK_ICNS := $(CURDIR)/scripts/pack_iphone_icns.sh
 
-C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_debug.c MTPFuse/mtp_bridge.c
+C_SRCS := MTPFuse/main.c MTPFuse/fs_ops.c MTPFuse/mtp_log.c MTPFuse/mtp_bridge.c
 
 SWIFT_SRCS := \
     AndroidMount/main.swift \
@@ -63,9 +65,10 @@ SWIFT_SRCS := \
 
 all: app mtpfuse bundle
 
-# Requires an MTP device + macFUSE; exercises mount, synth dirs, xattr, small copy.
+# Requires an MTP device + macFUSE; exercises mkdir, touch, cp, mv, rm, rmdir.
 check-mtpfuse: $(BUILD)/mtpfuse
-	@./scripts/mtpfuse-selftest.sh
+	@chmod +x ./scripts/test.sh
+	@./scripts/test.sh
 
 # Launches AndroidMount.app, waits for ~/.AndroidMount FUSE, runs same ops as check-mtpfuse.
 # Needs GUI session + device. Optional: ANDROIDMOUNT_E2E_RESTART=1 ANDROIDMOUNT_E2E_QUIT=1 make check-e2e
@@ -114,7 +117,8 @@ bundle: $(BUILD)/AndroidMount.bin $(BUILD)/mtpfuse
 	@echo "  built $(APP)"
 
 run: bundle
-	@open "$(APP)"
+	@chmod +x "$(CURDIR)/scripts/run.sh"
+	@"$(CURDIR)/scripts/run.sh" --open-only
 
 clean:
 	rm -rf $(BUILD)
